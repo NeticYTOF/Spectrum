@@ -435,22 +435,13 @@ mod tests {
         // grayscale ramp (232..255), not the cube.
         let lo = dither_p256([10, 10, 10], 0.1);
         let hi = dither_p256([10, 10, 10], 0.9);
-        assert!(
-            matches!(lo, Color::Indexed(i) if (232..256).contains(&i)),
-            "{lo:?}"
-        );
-        assert!(
-            matches!(hi, Color::Indexed(i) if (232..256).contains(&i)),
-            "{hi:?}"
-        );
+        assert!(matches!(lo, Color::Indexed(i) if i >= 232), "{lo:?}");
+        assert!(matches!(hi, Color::Indexed(i) if i >= 232), "{hi:?}");
         assert_ne!(lo, hi, "dithering must vary with threshold");
 
         // Mid neutral gray: both ends stay in the ramp.
         let a = dither_p256([139, 138, 137], 0.2);
-        assert!(
-            matches!(a, Color::Indexed(i) if (232..256).contains(&i)),
-            "{a:?}"
-        );
+        assert!(matches!(a, Color::Indexed(i) if i >= 232), "{a:?}");
 
         // Tinted colors stay in the cube (16..232).
         let tinted = dither_p256([200, 60, 30], 0.5);

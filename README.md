@@ -46,26 +46,41 @@ dithering.
 ## Usage
 
 ```
+# Visualize whatever Windows is playing (default system-output loopback)
+spectrum --capture
+
 # Play and visualize a file (mp3, wav, ogg vorbis, flac)
 spectrum song.mp3
 
-# Visualize live audio instead
-spectrum --capture
+# Silent synthetic demo: all visuals, no audio hardware touched
+spectrum --demo
 
 # With options
 spectrum song.mp3 --theme fire --bars 96 --sensitivity 1.4
-spectrum --capture --colors 16
+spectrum --capture --source mic          # explicit microphone
+spectrum --demo --mode 4 --exit-after 10  # scripted QA / screenshots
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `FILE` | - | Audio file to play and visualize |
-| `-c, --capture` | off | Visualize live audio instead of playing a file |
+| `-c, --capture` | - | Visualize live audio (see `--source`) |
+| `--demo` | off | Silent synthetic generator; no audio hardware |
+| `--source NAME` | system | `system` (Windows output loopback) or `mic` |
+| `--mode N` | 1 | Start in mode 1-5 (spectrum/scope/spectrogram/combo/mirror) |
+| `--exit-after SECS` | - | Exit cleanly after N seconds (scripted QA) |
 | `-t, --theme NAME` | spectrum | spectrum, fire, ice, matrix, vapor |
 | `--bars N` | 64 | Frequency bands (8..=256) |
 | `--sensitivity F` | 1.0 | FFT display gain (0.1..=4.0, must be finite) |
 | `--smoothing F` | 0.12 | Bar fall speed (0.01 slow .. 0.95 instant) |
 | `--colors MODE` | true | true (24-bit), 256 or 16 (both dithered) |
+
+Capture honesty: `--source system` opens the default *output* device via
+WASAPI loopback and never silently falls back to the microphone - if it
+cannot open, the error says what to try (`--source mic`). While running,
+the default output device is re-checked every second; switching speakers /
+headphones transparently rebuilds the stream (the status bar shows the live
+device and any reconnect state).
 
 ## Controls
 
@@ -95,11 +110,16 @@ spectrum --capture --colors 16
 ## Development
 
 ```
-cargo test                 # unit + regression tests
-cargo clippy               # lint (kept warning-free)
-cargo run --example preview  # headless visual check of all renderers
-cargo run -- song.mp3      # run from source
+cargo test                    # unit + regression tests
+cargo clippy                  # lint (kept warning-free)
+cargo run --example preview   # headless glyph-level check of all renderers
+cargo run --release -- --demo # silent visual check without audio
+cargo run -- song.mp3          # run from source
 ```
+
+Screenshots in `docs/screenshots/` were captured from the real running
+application (`--demo`, one window per mode/theme/depth) via
+`scripts/capture_all.ps1`.
 
 Architecture: `audio` (playback tap + capture) feeds a lock-batched sample
 queue to `analysis` (Hann-windowed FFT, log bands, spectral-flux beat
