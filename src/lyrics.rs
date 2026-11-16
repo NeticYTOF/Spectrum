@@ -160,6 +160,26 @@ fn should_apply(
         && current_media_key.map(|k| k == &req.key).unwrap_or(false)
 }
 
+/// Publication step: validate and assign a lookup result against the
+/// CURRENT UI state and media identity in ONE critical section (the
+/// caller holds the lyrics lock). This closes the race where the watcher
+/// installs a new key/generation/Loading between validation and the
+/// write, which would attach old words to the new track.
+///
+/// Returns true when the result was applied.
+fn apply_result(
+    st: &mut LyricsUiState,
+    current_media_key: Option<&TrackKey>,
+    req: &LookupRequest,
+    status: LyricsStatus,
+) -> bool {
+    if !should_apply(st.generation, current_media_key, req) {
+        return false;
+    }
+    st.status = status;
+    true
+}
+
 /// Spawn the lyrics pipeline: a watcher that never blocks on HTTP, and a
 /// lookup executor that applies results only when both the generation and
 /// the CURRENT media identity still match. The UI additionally gates on
@@ -226,39 +246,82 @@ pub fn spawn_lyrics(
         .spawn(move || {
             let agent = build_agent();
             // Terminal statuses (synced/plain/instrumental/no-match) are
-            // cached per identity, bounded. Transient failures are NOT
-            // cached permanently: they cool down and a later identity
-            // change may retry them.
+            // cached per identity, bounded. Transient failures cool down:
+            // the SAME song retries when the deadline passes (bounded,
+            // latest-request wins), and revisiting a cached error keeps
+            // its ORIGINAL deadline - no renewal.
             let mut cache: HashMap<TrackKey, LyricsStatus> = HashMap::new();
             let mut cache_order: Vec<TrackKey> = Vec::new();
             let mut cooldowns: HashMap<TrackKey, (LyricsStatus, Instant)> = HashMap::new();
             const COOLDOWN: Duration = Duration::from_secs(60);
+            // A transient error for the still-current track: retried when
+            // its deadline elapses (without an identity toggle), and
+            // superseded instantly by any newer watcher request.
+            let mut pending_retry: Option<(LookupRequest, Instant)> = None;
 
             while !stop.load(Ordering::Relaxed) {
-                let Ok(mut req) = rx.recv() else {
-                    return; // watcher gone: shut down
+                // Wait for a request. When the current track is cooling
+                // down, wait only until its retry deadline so the SAME
+                // song recovers without a metadata change; any watcher
+                // request takes over immediately (latest wins).
+                let mut req = match rx.recv_timeout(
+                    pending_retry
+                        .as_ref()
+                        .map(|(_, at)| at.saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::from_secs(3600)),
+                ) {
+                    Ok(next) => next,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Deadline hit: retry the cooling track.
+                        match pending_retry.take() {
+                            Some((r, _)) => r,
+                            None => continue,
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 };
                 // Latest-wins: drain any backlog (while a lookup was in
-                // flight, the watcher may have queued several changes).
+                // flight, the watcher may have queued several changes);
+                // a newer request cancels the pending retry.
                 while let Ok(next) = rx.try_recv() {
                     req = next;
+                    pending_retry = None;
                 }
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
 
-                let status = if let Some(hit) = cache.get(&req.key) {
-                    hit.clone()
-                } else if let Some((err, at)) = cooldowns.get(&req.key) {
-                    if at.elapsed() < COOLDOWN {
-                        err.clone()
-                    } else {
-                        cooldowns.remove(&req.key);
-                        lookup_interruptible(&agent, &req.key, &stop)
+                let now = Instant::now();
+                let mut status = None;
+                let mut retry_at: Option<Instant> = None;
+                match cooldown_action(&cache, &cooldowns, &req.key, now, COOLDOWN) {
+                    CooldownAction::Cached(hit) => status = Some(hit),
+                    CooldownAction::CoolingDown(err, remaining) => {
+                        // Keep serving the cached error; retry when the
+                        // ORIGINAL deadline elapses - no renewal.
+                        retry_at = Some(now + remaining);
+                        status = Some(err);
                     }
-                } else {
-                    lookup_interruptible(&agent, &req.key, &stop)
-                };
+                    CooldownAction::Fetch => {
+                        let s = lookup_interruptible(&agent, &req.key, &stop);
+                        if let LyricsStatus::Error(_) = &s {
+                            // FRESH error: write the deadline once.
+                            cooldowns.insert(req.key.clone(), (s.clone(), now));
+                            if cooldowns.len() > CACHE_LIMIT {
+                                if let Some(oldest) = cooldowns
+                                    .iter()
+                                    .min_by_key(|(_, (_, at))| *at)
+                                    .map(|(k, _)| k.clone())
+                                {
+                                    cooldowns.remove(&oldest);
+                                }
+                            }
+                            retry_at = Some(now + COOLDOWN);
+                        }
+                        status = Some(s);
+                    }
+                }
+                let status = status.expect("every branch sets a status");
 
                 match &status {
                     // Terminal: cache so the same identity never refetches.
@@ -273,39 +336,66 @@ pub fn spawn_lyrics(
                             cache.remove(&evict);
                         }
                     }
-                    // Transient (network/5xx/rate-limit): cooldown, retry
-                    // allowed after it passes.
+                    // Transient (network/5xx/rate-limit): schedule the
+                    // bounded same-track retry at the deadline computed
+                    // above (fresh or original - never renewed). A newer
+                    // watcher request supersedes it instantly.
                     LyricsStatus::Error(_) => {
-                        cooldowns.insert(req.key.clone(), (status.clone(), Instant::now()));
-                        if cooldowns.len() > CACHE_LIMIT {
-                            // Bounded: drop the oldest cooldown entry.
-                            if let Some(oldest) = cooldowns
-                                .iter()
-                                .min_by_key(|(_, (_, at))| *at)
-                                .map(|(k, _)| k.clone())
-                            {
-                                cooldowns.remove(&oldest);
-                            }
-                        }
+                        pending_retry = retry_at.map(|at| (req.clone(), at));
                     }
                     // Loading/Unavailable never come back from a lookup.
                     LyricsStatus::Loading | LyricsStatus::Unavailable => {}
                 }
 
-                // Apply only if the request is still current: re-read the
-                // LIVE media identity, not just the watcher's UI state.
+                // Apply only if the request is still current. The media
+                // identity is read first (it is only changed by the actual
+                // media thread, never by the watcher), then the lyrics
+                // lock is taken ONCE and validation + assignment happen in
+                // the SAME critical section - the watcher cannot slip a
+                // new key/generation in between validation and the write,
+                // so old words can never attach to a new track.
                 let snap = media.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let live_key = TrackKey::from_snapshot(&snap);
-                let st_generation = lyrics.lock().unwrap_or_else(|e| e.into_inner()).generation;
-                if should_apply(st_generation, live_key.as_ref(), &req) {
-                    let mut st = lyrics.lock().unwrap_or_else(|e| e.into_inner());
-                    st.status = status;
-                }
+                let mut st = lyrics.lock().unwrap_or_else(|e| e.into_inner());
+                apply_result(&mut st, live_key.as_ref(), &req, status);
             }
         })
         .expect("failed to spawn lyrics executor thread");
 
     vec![watcher, executor]
+}
+
+/// What the executor should do for a lookup request given the cooldown
+/// bookkeeping. Pure and unit-testable - the renewal bug lived here
+/// (revisiting a cached error must NOT rewrite its deadline).
+#[derive(Debug)]
+enum CooldownAction {
+    /// A terminal (cached) result exists: return it.
+    Cached(LyricsStatus),
+    /// A transient error is still cooling down: return it, keeping the
+    /// ORIGINAL deadline (no renewal on revisit).
+    CoolingDown(LyricsStatus, Duration),
+    /// The cooldown elapsed (or none exists): fetch.
+    Fetch,
+}
+
+fn cooldown_action(
+    cache: &HashMap<TrackKey, LyricsStatus>,
+    cooldowns: &HashMap<TrackKey, (LyricsStatus, Instant)>,
+    key: &TrackKey,
+    now: Instant,
+    cooldown: Duration,
+) -> CooldownAction {
+    if let Some(hit) = cache.get(key) {
+        return CooldownAction::Cached(hit.clone());
+    }
+    if let Some((err, at)) = cooldowns.get(key) {
+        let elapsed = now.duration_since(*at);
+        if elapsed < cooldown {
+            return CooldownAction::CoolingDown(err.clone(), cooldown - elapsed);
+        }
+    }
+    CooldownAction::Fetch
 }
 
 fn build_agent() -> ureq::Agent {
@@ -815,6 +905,161 @@ mod tests {
             watch_step(&Some(a.clone()), &Some(a.clone())),
             WatchStep::Unchanged
         ));
+    }
+
+    #[test]
+    fn cooldown_recovery_same_track_after_deadline() {
+        // Failure -> cooldown elapses -> the SAME track fetches again.
+        let k = key();
+        let mut cache = HashMap::new();
+        let mut cooldowns = HashMap::new();
+        let cooldown = Duration::from_secs(60);
+
+        // A fresh failure records the deadline.
+        let now = Instant::now();
+        cooldowns.insert(k.clone(), (LyricsStatus::Error("net".into()), now));
+
+        // Revisit right away: serving the cached error, retry scheduled at
+        // the ORIGINAL deadline (60s out).
+        match cooldown_action(&cache, &cooldowns, &k, now, cooldown) {
+            CooldownAction::CoolingDown(_, remaining) => {
+                assert!(
+                    remaining.as_secs() >= 59,
+                    "~60s left, got {}",
+                    remaining.as_secs()
+                );
+            }
+            other => panic!("expected CoolingDown, got {other:?}"),
+        }
+
+        // After the deadline: Fetch (the retry happens).
+        let later = now + Duration::from_secs(61);
+        assert!(matches!(
+            cooldown_action(&cache, &cooldowns, &k, later, cooldown),
+            CooldownAction::Fetch
+        ));
+
+        // And a terminal result once cached always serves.
+        cache.insert(k.clone(), LyricsStatus::NoMatch);
+        assert!(matches!(
+            cooldown_action(&cache, &cooldowns, &k, later, cooldown),
+            CooldownAction::Cached(_)
+        ));
+    }
+
+    #[test]
+    fn cooldown_revisit_preserves_original_deadline() {
+        // Revisiting a cached error must NOT renew its deadline: after
+        // several revisits within the window, the remaining time still
+        // counts from the ORIGINAL failure.
+        let k = key();
+        let mut cache = HashMap::new();
+        let mut cooldowns = HashMap::new();
+        let cooldown = Duration::from_secs(60);
+
+        let t0 = Instant::now();
+        cooldowns.insert(k.clone(), (LyricsStatus::Error("net".into()), t0));
+
+        // Three revisits at t0+10s, t0+20s, t0+30s.
+        for offset in [10, 20, 30] {
+            let at = t0 + Duration::from_secs(offset);
+            match cooldown_action(&cache, &cooldowns, &k, at, cooldown) {
+                CooldownAction::CoolingDown(_, remaining) => {
+                    // Remaining shrinks with the ORIGINAL start: at t0+30,
+                    // 30s remain (not 60 - renewal would reset it).
+                    let expected = (60 - offset) as u64;
+                    assert!(
+                        remaining.as_secs().abs_diff(expected) <= 1,
+                        "revisit at +{offset}s must keep the original deadline, got {}s left",
+                        remaining.as_secs()
+                    );
+                }
+                other => panic!("expected CoolingDown at +{offset}s, got {other:?}"),
+            }
+            // The revisit itself must not touch the stored deadline.
+            let stored = cooldowns.get(&k).unwrap();
+            assert_eq!(stored.1, t0, "stored deadline must not be renewed");
+        }
+
+        // At t0+61 the ORIGINAL deadline has elapsed: fetch.
+        let at = t0 + Duration::from_secs(61);
+        assert!(matches!(
+            cooldown_action(&cache, &cooldowns, &k, at, cooldown),
+            CooldownAction::Fetch
+        ));
+    }
+
+    #[test]
+    fn publication_race_watcher_change_during_lookup() {
+        // The exact reported race: the executor validates against the UI
+        // state, the watcher installs a new track, then the executor
+        // assigns - old words would attach to the new key and pass the
+        // UI identity gate. apply_result validates and assigns in ONE
+        // critical section, so this interleaving is now impossible;
+        // this test forces the interleaved world-state and proves it.
+        let a = key();
+        let b = TrackKey {
+            artist: "Other".into(),
+            title: "Track".into(),
+            album: String::new(),
+            duration_s: Some(200),
+        };
+
+        // Watcher installed A/gen 1, lookup for A completed with lyrics.
+        let req = LookupRequest {
+            generation: 1,
+            key: a.clone(),
+        };
+        let synced = LyricsStatus::Synced(vec![crate::lrc::LrcLine {
+            time_s: 0.0,
+            text: "old words".into(),
+        }]);
+
+        // Interleaving: watcher has JUST moved to B (gen 2, Loading), and
+        // the media snapshot agrees with B. The A result must be refused
+        // in the same critical section that would write it.
+        let mut st = LyricsUiState {
+            key: Some(b.clone()),
+            status: LyricsStatus::Loading,
+            generation: 2,
+        };
+        let applied = apply_result(&mut st, Some(&b), &req, synced);
+        assert!(!applied, "stale A result must not attach to B");
+        assert_eq!(
+            st.status,
+            LyricsStatus::Loading,
+            "B keeps its loading state"
+        );
+        assert_eq!(st.key, Some(b));
+        assert_eq!(st.generation, 2);
+
+        // And the A -> B -> A variant: media came back to A but the
+        // generation moved on - still refused.
+        let mut st2 = LyricsUiState {
+            key: Some(a.clone()),
+            status: LyricsStatus::Loading,
+            generation: 3,
+        };
+        assert!(!apply_result(
+            &mut st2,
+            Some(&a),
+            &req,
+            LyricsStatus::NoMatch
+        ));
+        assert_eq!(st2.status, LyricsStatus::Loading);
+
+        // The healthy case: same generation, same identity - applied.
+        let mut st3 = LyricsUiState {
+            key: Some(a.clone()),
+            status: LyricsStatus::Loading,
+            generation: 1,
+        };
+        let ok = LyricsStatus::Synced(vec![crate::lrc::LrcLine {
+            time_s: 0.0,
+            text: "right words".into(),
+        }]);
+        assert!(apply_result(&mut st3, Some(&a), &req, ok.clone()));
+        assert_eq!(st3.status, ok);
     }
 
     #[test]
