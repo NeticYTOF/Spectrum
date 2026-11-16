@@ -284,13 +284,24 @@ impl MaskGrid {
             return;
         }
         let half = w.max(MIN_LW) / 2.0;
-        let (x0, y0, x1, y1) = poly_bbox(pts);
-        let (i0, j0, i1, j1) = self.bbox_sub(x0 - half, y0 - half, x1 + half, y1 + half);
-        for j in j0..j1 {
-            for i in i0..i1 {
-                let (px, py) = Self::sample_xy(i, j);
-                if dist_to_polyline(px, py, pts) <= half {
-                    self.set(i, j, role);
+        // Segment by segment over each segment's own (padded) box: the
+        // union of round-capped segments is exactly the stroked polyline,
+        // at a cost proportional to the stroke's area rather than to its
+        // bounding box times its segment count.
+        for seg in pts.windows(2) {
+            let (a, b) = (seg[0], seg[1]);
+            let (i0, j0, i1, j1) = self.bbox_sub(
+                a.0.min(b.0) - half,
+                a.1.min(b.1) - half,
+                a.0.max(b.0) + half,
+                a.1.max(b.1) + half,
+            );
+            for j in j0..j1 {
+                for i in i0..i1 {
+                    let (px, py) = Self::sample_xy(i, j);
+                    if dist_to_polyline(px, py, seg) <= half {
+                        self.set(i, j, role);
+                    }
                 }
             }
         }

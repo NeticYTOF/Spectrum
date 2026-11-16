@@ -1344,6 +1344,29 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn frame_cost_probe() {
+        // Average draw cost per frame at 144x42 (release build recommended).
+        for mode in 1..=6u8 {
+            let frames = 120.0;
+            let t0 = std::time::Instant::now();
+            let _ = snapshot(&Snapshot {
+                mode,
+                theme: "spectrum",
+                depth: ColorDepth::True,
+                at: 4.5,
+                frozen: false,
+                warmup: (frames - 1.0) / 60.0,
+                lyric: None,
+                width: 144,
+                height: 42,
+            });
+            let per = t0.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+            println!("mode {mode}: {per:.2} ms/frame");
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn motion_probe() {
         // Frame-to-frame change rate per mode (live, 60 fps): flicker or
         // jitter shows up as a high rate of cells changing between two
