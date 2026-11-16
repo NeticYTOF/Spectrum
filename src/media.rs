@@ -149,7 +149,7 @@ mod imp {
     }
 
     pub fn read_smtc() -> SmtcState {
-        SmtcState
+        SmtcState::default()
     }
 }
 
