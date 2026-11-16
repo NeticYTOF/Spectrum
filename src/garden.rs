@@ -421,7 +421,7 @@ impl Vine {
         }
         let r = self.flower_r * bloom.max(0.2);
         let (cx, cy) = tip;
-        let petals = 6;
+        let petals = 8;
         for p in 0..petals {
             let ang = p as f32 / petals as f32 * PI * 2.0;
             let px = cx + ang.cos() * r * 0.85;
@@ -487,14 +487,14 @@ fn garden_vines(
         let phase = r() * 2.0 * PI;
         let bend = (r() - 0.5) * 0.9;
         let kind_roll = r();
-        let tip = if kind_roll < 0.55 {
+        let tip = if kind_roll < 0.6 {
             Tip::Flower
         } else if kind_roll < 0.8 {
             Tip::Curl
         } else {
             Tip::LeafFan
         };
-        let flower_r = 1.8 + r() * 1.6;
+        let flower_r = 2.4 + r() * 1.8;
         let mut leaves = Vec::new();
         if r() < 0.7 {
             leaves.push((0.25 + r() * 0.45, if r() < 0.5 { 1.0 } else { -1.0 }));
