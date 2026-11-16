@@ -1,14 +1,16 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use spectrum::analysis::{FrameAnalysis, Params, SharedState, DEFAULT_BANDS};
-use spectrum::audio::SampleQueue;
+use spectrum::audio::{self, CaptureSource, SampleQueue};
+use spectrum::demo;
 use spectrum::theme::{self, ColorDepth};
-use spectrum::{analysis, audio, ui};
+use spectrum::ui;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -20,13 +22,29 @@ struct Args {
     /// Audio file to play and visualize (mp3, wav, ogg, flac)
     file: Option<PathBuf>,
 
-    /// Visualize live audio instead of playing a file (system loopback on Windows)
+    /// Visualize live audio instead of playing a file
     #[arg(short, long)]
     capture: bool,
+
+    /// Silent synthetic demo instead of real audio (all visuals, no sound)
+    #[arg(long)]
+    demo: bool,
+
+    /// Live capture source: system (Windows output loopback) or mic
+    #[arg(long, default_value = "system")]
+    source: String,
 
     /// Color theme: spectrum, fire, ice, matrix, vapor
     #[arg(short, long, default_value = "spectrum")]
     theme: String,
+
+    /// Start visualization in this mode (1-5)
+    #[arg(long)]
+    mode: Option<u8>,
+
+    /// Exit after this many seconds (for scripted QA / screenshots)
+    #[arg(long)]
+    exit_after: Option<f32>,
 
     /// Number of frequency bands (8..=256)
     #[arg(long, default_value_t = DEFAULT_BANDS)]
@@ -48,14 +66,20 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.capture && args.file.is_some() {
-        bail!("pass either an audio file or --capture, not both");
+    let inputs = [args.file.is_some(), args.capture, args.demo];
+    if inputs.iter().filter(|b| **b).count() > 1 {
+        bail!("pass only one of: an audio file, --capture, or --demo");
     }
 
     // clap parses NaN/inf into f32 happily; reject them here rather than
     // letting NaN propagate into the analysis math.
     ensure_finite("sensitivity", args.sensitivity)?;
     ensure_finite("smoothing", args.smoothing)?;
+    if let Some(secs) = args.exit_after {
+        if !secs.is_finite() || secs <= 0.0 {
+            bail!("--exit-after must be a positive number of seconds");
+        }
+    }
 
     let depth = ColorDepth::parse(&args.colors).with_context(|| {
         format!(
@@ -72,14 +96,14 @@ fn main() -> Result<()> {
         )
     })?;
 
+    let start_mode = match args.mode {
+        None => None,
+        Some(m) if (1..=5).contains(&m) => Some(m),
+        Some(m) => bail!("--mode must be 1-5, got {m}"),
+    };
+
     // Clamp once here so every component sees consistent values.
     let bands = args.bars.clamp(8, 256);
-
-    let queue: SampleQueue = audio::new_queue();
-    let handle = match &args.file {
-        Some(path) => audio::start_file(path, queue.clone())?,
-        None => audio::start_capture(queue.clone())?,
-    };
 
     let shared = Arc::new(Mutex::new(SharedState {
         latest: Arc::new(FrameAnalysis::quiet(bands)),
@@ -92,19 +116,46 @@ fn main() -> Result<()> {
     }));
 
     let stop = Arc::new(AtomicBool::new(false));
-    let analyzer = analysis::spawn_analyzer(
-        handle.meta.sample_rate,
-        bands,
-        queue.clone(),
-        shared.clone(),
-        stop.clone(),
-    );
+    let exit_after = args.exit_after.map(|secs| Duration::from_secs_f32(secs));
 
-    // ui::run restores the terminal on all exits, including errors.
-    let result = ui::run(&shared, &handle, theme.name, depth);
-
-    stop.store(true, Ordering::Relaxed);
-    let _ = analyzer.join();
+    let result = if args.demo {
+        // No audio hardware is touched at all.
+        let handle = audio::AudioHandle::for_demo();
+        let demo_thread = demo::spawn_demo(
+            shared.clone(),
+            bands,
+            stop.clone(),
+            handle.demo_pause.clone(),
+        );
+        let r = ui::run(&shared, &handle, theme.name, depth, start_mode, exit_after);
+        stop.store(true, Ordering::Relaxed);
+        let _ = demo_thread.join();
+        r
+    } else {
+        let queue: SampleQueue = audio::new_queue();
+        let handle = if let Some(path) = &args.file {
+            audio::start_file(path, queue.clone())?
+        } else {
+            let source = CaptureSource::parse(&args.source).with_context(|| {
+                format!(
+                    "unknown capture source '{}'; expected system or mic",
+                    args.source
+                )
+            })?;
+            audio::start_capture(queue.clone(), source)?
+        };
+        let analyzer = spectrum::analysis::spawn_analyzer(
+            handle.meta_snapshot().sample_rate,
+            bands,
+            queue.clone(),
+            shared.clone(),
+            stop.clone(),
+        );
+        let r = ui::run(&shared, &handle, theme.name, depth, start_mode, exit_after);
+        stop.store(true, Ordering::Relaxed);
+        let _ = analyzer.join();
+        r
+    };
 
     result
 }
@@ -133,5 +184,18 @@ mod tests {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(ensure_finite("sensitivity", bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn exit_after_validation() {
+        // The clamp logic used by main; mirrored here for regression.
+        fn ok(secs: Option<f32>) -> bool {
+            secs.map(|s| s.is_finite() && s > 0.0).unwrap_or(true)
+        }
+        assert!(ok(None));
+        assert!(ok(Some(5.0)));
+        assert!(!ok(Some(0.0)));
+        assert!(!ok(Some(-1.0)));
+        assert!(!ok(Some(f32::NAN)));
     }
 }

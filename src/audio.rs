@@ -2,10 +2,11 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use rodio::{Decoder, OutputStream, Sink, Source};
 
 /// Maximum samples buffered between the audio producer and the analyzer.
@@ -41,15 +42,68 @@ pub fn push_samples(queue: &SampleQueue, samples: &[f32]) {
 pub struct AudioMeta {
     pub sample_rate: u32,
     pub description: String,
+    /// Honest capture status shown in the UI ("ok" / "reconnecting" /
+    /// the last device error).
+    pub status: &'static str,
+}
+
+/// Which live source to capture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CaptureSource {
+    /// Whatever Windows is outputting (WASAPI loopback on the default
+    /// output device).
+    System,
+    /// The default recording device.
+    Microphone,
+}
+
+impl CaptureSource {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "system" | "output" | "loopback" => Some(CaptureSource::System),
+            "mic" | "microphone" | "input" => Some(CaptureSource::Microphone),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CaptureSource::System => "system output",
+            CaptureSource::Microphone => "microphone",
+        }
+    }
+}
+
+/// UI -> capture-owner commands.
+#[derive(Clone, Copy)]
+enum CapCmd {
+    Pause,
+    Play,
+}
+
+/// State shared between the UI thread and the capture owner: the command
+/// channel plus honest status. The `cpal::Stream` itself never appears here
+/// (or anywhere shared): cpal marks `Stream` `!Send` on every platform, so
+/// the stream is created, used and dropped on the owner thread alone.
+struct CaptureShared {
+    tx: Sender<CapCmd>,
+    device_name: String,
+    paused: bool,
+    /// Set when a device change was detected but the new stream could not
+    /// be opened; cleared on the next successful reopen.
+    last_error: Option<String>,
 }
 
 /// Running audio source plus the handles needed to control it.
 pub struct AudioHandle {
-    pub meta: AudioMeta,
+    pub meta: Arc<Mutex<AudioMeta>>,
     pub sink: Option<Sink>,
-    pub stream: Option<cpal::Stream>,
+    capture: Option<Arc<Mutex<CaptureShared>>>,
     /// Must outlive `sink`; dropping it stops all playback.
     _output: Option<OutputStream>,
+    /// Demo mode: no audio hardware is touched at all.
+    pub demo: bool,
+    pub demo_pause: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl AudioHandle {
@@ -58,19 +112,51 @@ impl AudioHandle {
     }
 
     pub fn pause(&self) {
+        if self.demo {
+            if let Some(p) = &self.demo_pause {
+                p.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
         if let Some(sink) = &self.sink {
             sink.pause();
-        } else if let Some(stream) = &self.stream {
-            let _ = stream.pause();
+        } else if let Some(cap) = &self.capture {
+            let mut shared = cap.lock().unwrap_or_else(|e| e.into_inner());
+            shared.paused = true;
+            let _ = shared.tx.send(CapCmd::Pause);
         }
     }
 
     pub fn resume(&self) {
+        if self.demo {
+            if let Some(p) = &self.demo_pause {
+                p.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
         if let Some(sink) = &self.sink {
             sink.play();
-        } else if let Some(stream) = &self.stream {
-            let _ = stream.play();
+        } else if let Some(cap) = &self.capture {
+            let mut shared = cap.lock().unwrap_or_else(|e| e.into_inner());
+            shared.paused = false;
+            let _ = shared.tx.send(CapCmd::Play);
         }
+    }
+
+    /// Honest pause state (capture tracks it explicitly since cpal offers
+    /// no query).
+    pub fn is_paused(&self) -> bool {
+        if self.demo {
+            return self
+                .demo_pause
+                .as_ref()
+                .map(|p| p.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false);
+        }
+        if let Some(cap) = &self.capture {
+            return cap.lock().unwrap_or_else(|e| e.into_inner()).paused;
+        }
+        false
     }
 
     /// True when file playback has run to the end.
@@ -86,6 +172,28 @@ impl AudioHandle {
         if let Some(sink) = &self.sink {
             sink.set_volume(v.clamp(0.0, 1.0));
         }
+    }
+
+    /// A demo handle: no devices, no threads, nothing to pause but the
+    /// synthetic generator itself.
+    pub fn for_demo() -> Self {
+        Self {
+            meta: Arc::new(Mutex::new(AudioMeta {
+                sample_rate: 44_100,
+                description: "synthetic \u{b7} silent".into(),
+                status: "demo",
+            })),
+            sink: None,
+            capture: None,
+            _output: None,
+            demo: true,
+            demo_pause: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        }
+    }
+
+    /// Human-readable meta snapshot for the status bar.
+    pub fn meta_snapshot(&self) -> AudioMeta {
+        self.meta.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -222,6 +330,14 @@ where
 pub const DEFAULT_VOLUME: f32 = 0.8;
 
 /// Play an audio file through rodio while tapping the stream for analysis.
+///
+/// Sample-rate note (verified against rodio 0.19.0 source): `Sink::append`
+/// feeds a `SourcesQueue` whose output the `OutputStream`'s dynamic mixer
+/// (built at the *device's* default config) wraps in a `UniformSourceIterator`
+/// that linearly resamples every source to the device rate and channel
+/// count. Playback therefore runs at the correct pitch for any file rate,
+/// and this tap sits *before* that conversion, so the analyzer correctly
+/// maps FFT bins using the file's own sample rate.
 pub fn start_file(path: &Path, queue: SampleQueue) -> Result<AudioHandle> {
     let file = File::open(path).with_context(|| format!("failed to open '{}'", path.display()))?;
     let decoder = Decoder::new(BufReader::new(file))
@@ -249,13 +365,16 @@ pub fn start_file(path: &Path, queue: SampleQueue) -> Result<AudioHandle> {
     sink.append(tee);
 
     Ok(AudioHandle {
-        meta: AudioMeta {
+        meta: Arc::new(Mutex::new(AudioMeta {
             sample_rate,
             description,
-        },
+            status: "playing",
+        })),
         sink: Some(sink),
-        stream: None,
+        capture: None,
         _output: Some(stream),
+        demo: false,
+        demo_pause: None,
     })
 }
 
@@ -325,11 +444,25 @@ where
     Ok(stream)
 }
 
-fn open_capture_stream(device: &cpal::Device, queue: SampleQueue) -> Result<(cpal::Stream, u32)> {
-    let supported = device
-        .default_input_config()
-        .or_else(|_| device.default_output_config())
-        .context("no usable stream configuration")?;
+/// Open one capture stream on `device`.
+///
+/// Config selection is direction-aware (verified against cpal 0.15.3's
+/// WASAPI host): loopback opens the default *output* device as an input
+/// stream, and the shared-mode mix format from `default_output_config()`
+/// is the format WASAPI loopback guarantees; `default_input_config()` on
+/// an output device has no formats at all. Microphones use the input
+/// config. The format dispatch covers every cpal sample type.
+fn open_capture_stream(
+    device: &cpal::Device,
+    queue: SampleQueue,
+    loopback: bool,
+) -> Result<(cpal::Stream, u32)> {
+    let supported = if loopback {
+        device.default_output_config()
+    } else {
+        device.default_input_config()
+    }
+    .context("the device reported no usable stream configuration")?;
     let sample_rate = supported.sample_rate().0;
     if sample_rate == 0 {
         bail!("device reported an invalid sample rate");
@@ -353,48 +486,207 @@ fn open_capture_stream(device: &cpal::Device, queue: SampleQueue) -> Result<(cpa
     Ok((stream, sample_rate))
 }
 
-/// Capture live audio.
+fn describe(source: CaptureSource, device_name: &str, status: &str) -> String {
+    format!(
+        "{source} \u{b7} {device_name} \u{b7} {status}",
+        source = source.name()
+    )
+}
+
+/// Capture live audio from an explicitly chosen source. No silent
+/// fallback: system capture failing is an error that tells the user what
+/// to try next.
 ///
-/// On Windows the default *output* device is opened as an input stream
-/// (WASAPI loopback), which visualizes whatever the system is playing.
-/// If that fails - or on other platforms - the default input device
-/// (microphone / monitor) is used instead.
-pub fn start_capture(queue: SampleQueue) -> Result<AudioHandle> {
-    let host = cpal::default_host();
+/// All device and stream handling happens on a dedicated capture-owner
+/// thread, because `cpal::Stream` is `!Send` on every platform. For system
+/// capture on Windows the owner re-resolves the default *output* device
+/// every second and transparently rebuilds the WASAPI loopback stream
+/// when it changes, carrying the pause state over.
+pub fn start_capture(queue: SampleQueue, source: CaptureSource) -> Result<AudioHandle> {
+    let (tx, cmd_rx) = mpsc::channel::<CapCmd>();
+    let capture = Arc::new(Mutex::new(CaptureShared {
+        tx,
+        device_name: String::new(),
+        paused: false,
+        last_error: None,
+    }));
+    let meta = Arc::new(Mutex::new(AudioMeta {
+        sample_rate: 0,
+        description: String::new(),
+        status: "starting",
+    }));
+    let (init_tx, init_rx) = mpsc::channel::<Result<(String, u32), String>>();
 
-    let mut candidates: Vec<(&'static str, cpal::Device)> = Vec::new();
-    if cfg!(windows) {
-        if let Some(dev) = host.default_output_device() {
-            candidates.push(("system loopback", dev));
-        }
-    }
-    if let Some(dev) = host.default_input_device() {
-        candidates.push(("microphone", dev));
-    }
-    if candidates.is_empty() {
-        bail!("no audio capture devices found");
-    }
+    std::thread::Builder::new()
+        .name("spectrum-capture".into())
+        .spawn({
+            let capture = capture.clone();
+            let meta = meta.clone();
+            move || capture_owner_loop(source, queue, cmd_rx, capture, meta, init_tx)
+        })
+        .context("failed to spawn the capture thread")?;
 
-    let mut attempts = Vec::new();
-    for (kind, device) in candidates {
-        let name = device.name().unwrap_or_else(|_| "unknown device".into());
-        match open_capture_stream(&device, queue.clone()) {
-            Ok((stream, sample_rate)) => {
-                return Ok(AudioHandle {
-                    meta: AudioMeta {
-                        sample_rate,
-                        description: format!("live \u{b7} {kind} ({name})"),
-                    },
-                    sink: None,
-                    stream: Some(stream),
-                    _output: None,
-                })
+    // Wait for the initial build on the owner thread so failures surface
+    // here as honest, actionable errors.
+    let init = init_rx
+        .recv()
+        .map_err(|_| anyhow!("the capture thread exited before opening a stream"))?;
+    let (device_name, sample_rate) = init.map_err(|err| {
+        let advice = match source {
+            CaptureSource::System => {
+                "system-output capture failed: make sure an audio output device is \
+                 enabled, or run with --source mic to use a microphone instead"
             }
-            Err(err) => attempts.push(format!("  - {kind} ({name}): {err:#}")),
-        }
+            CaptureSource::Microphone => {
+                "microphone capture failed: check that a recording device is \
+                 enabled and not in use exclusively, or run with --source system"
+            }
+        };
+        anyhow!("{advice}\ncaused by: {err}")
+    })?;
+
+    {
+        let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
+        m.sample_rate = sample_rate;
+        m.description = describe(source, &device_name, "live");
+        m.status = "live";
     }
 
-    bail!("failed to start audio capture.\n{}", attempts.join("\n"))
+    Ok(AudioHandle {
+        meta,
+        sink: None,
+        capture: Some(capture),
+        _output: None,
+        demo: false,
+        demo_pause: None,
+    })
+}
+
+/// The capture owner thread body: resolves the initial device, builds the
+/// stream, then serves pause/play commands and re-checks the default
+/// output device about once a second (system capture only), rebuilding the
+/// loopback stream on change. Exits when the command channel closes (the
+/// `AudioHandle` was dropped), dropping the stream and stopping capture.
+fn capture_owner_loop(
+    source: CaptureSource,
+    queue: SampleQueue,
+    cmd_rx: Receiver<CapCmd>,
+    shared: Arc<Mutex<CaptureShared>>,
+    meta: Arc<Mutex<AudioMeta>>,
+    init_tx: Sender<Result<(String, u32), String>>,
+) {
+    use cpal::traits::DeviceTrait;
+
+    let loopback = source == CaptureSource::System && cfg!(windows);
+
+    // Resolve + build the first stream on this thread.
+    let Some(device) = resolve_device(source) else {
+        let _ = init_tx.send(Err(format!(
+            "no {} device found",
+            match source {
+                CaptureSource::System => "default output",
+                CaptureSource::Microphone => "default input",
+            }
+        )));
+        return;
+    };
+    let mut device_name = device
+        .name()
+        .map(|n| {
+            if n.trim().is_empty() {
+                "default device".into()
+            } else {
+                n
+            }
+        })
+        .unwrap_or_else(|_| "default device".into());
+    let mut stream = match open_capture_stream(&device, queue.clone(), loopback) {
+        Ok((s, rate)) => {
+            {
+                let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                sh.device_name = device_name.clone();
+            }
+            let _ = init_tx.send(Ok((device_name.clone(), rate)));
+            s
+        }
+        Err(err) => {
+            let _ = init_tx.send(Err(format!(
+                "failed to open {} on '{device_name}': {err:#}",
+                source.name()
+            )));
+            return;
+        }
+    };
+
+    let mut last_check = std::time::Instant::now();
+    loop {
+        match cmd_rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(CapCmd::Pause) => {
+                let _ = stream.pause();
+            }
+            Ok(CapCmd::Play) => {
+                let _ = stream.play();
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        // Re-check the default output device about once a second.
+        if source != CaptureSource::System
+            || last_check.elapsed() < std::time::Duration::from_secs(1)
+        {
+            continue;
+        }
+        last_check = std::time::Instant::now();
+
+        let Some(new_device) = resolve_device(source) else {
+            continue;
+        };
+        let Ok(new_name) = new_device.name() else {
+            continue;
+        };
+        if new_name == device_name {
+            continue;
+        }
+        // The default output changed: rebuild the loopback stream on it,
+        // carrying the pause state over.
+        let paused = shared.lock().unwrap_or_else(|e| e.into_inner()).paused;
+        match open_capture_stream(&new_device, queue.clone(), true) {
+            Ok((new_stream, rate)) => {
+                if paused {
+                    let _ = new_stream.pause();
+                }
+                stream = new_stream;
+                device_name = new_name;
+                let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                sh.device_name = device_name.clone();
+                sh.last_error = None;
+                let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
+                m.sample_rate = rate;
+                m.description = describe(source, &device_name, "live");
+                m.status = "live";
+            }
+            Err(err) => {
+                let detail = format!("{err:#}");
+                let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                sh.last_error = Some(detail.clone());
+                let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
+                m.description = format!("{} \u{b7} reconnecting ({detail})", source.name());
+                m.status = "reconnecting";
+            }
+        }
+    }
+    // Channel closed: dropping `stream` stops capture.
+    drop(stream);
+}
+
+fn resolve_device(source: CaptureSource) -> Option<cpal::Device> {
+    use cpal::traits::HostTrait;
+    let host = cpal::default_host();
+    match source {
+        CaptureSource::System => host.default_output_device(),
+        CaptureSource::Microphone => host.default_input_device(),
+    }
 }
 
 #[cfg(test)]

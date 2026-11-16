@@ -68,6 +68,8 @@ impl Mode {
 const BEAT_FLASH_DECAY_PER_SEC: f32 = 8.0;
 /// Spectrogram scroll: one new column this often.
 const GRAM_INTERVAL_SECS: f32 = 1.0 / 30.0;
+/// Spectrogram history bound in columns; >= any realistic terminal width.
+const GRAM_HISTORY: usize = 1024;
 
 pub struct App {
     pub mode: Mode,
@@ -112,7 +114,7 @@ impl App {
             fall: state.params.fall,
             volume,
             peaks: Vec::new(),
-            gram: VecDeque::with_capacity(520),
+            gram: VecDeque::with_capacity(GRAM_HISTORY + 16),
             gram_accum: 0.0,
             last_frame: Instant::now(),
             scratch: visualizers::RenderScratch::new(),
@@ -134,6 +136,8 @@ pub fn run(
     audio: &AudioHandle,
     theme_name: &str,
     depth: ColorDepth,
+    start_mode: Option<u8>,
+    exit_after: Option<std::time::Duration>,
 ) -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
@@ -144,7 +148,23 @@ pub fn run(
         terminal.hide_cursor()?;
 
         let mut app = App::new(shared, audio, theme_name, depth);
-        let r = event_loop(&mut terminal, shared, audio, &mut app);
+        if let Some(m) = start_mode {
+            app.mode = match m {
+                1 => Mode::Bars,
+                2 => Mode::Scope,
+                3 => Mode::Gram,
+                4 => Mode::Combo,
+                _ => Mode::Mirror,
+            };
+        }
+        let started = Instant::now();
+        let r = event_loop(
+            &mut terminal,
+            shared,
+            audio,
+            &mut app,
+            exit_after.map(|d| started + d),
+        );
 
         let _ = terminal.show_cursor();
         r
@@ -160,6 +180,7 @@ fn event_loop(
     shared: &Arc<Mutex<SharedState>>,
     audio: &AudioHandle,
     app: &mut App,
+    exit_at: Option<Instant>,
 ) -> Result<()> {
     loop {
         // Input: wait up to ~14 ms for a key, then drain any backlog so
@@ -169,6 +190,13 @@ fn event_loop(
                 if let Event::Key(key) = event::read()? {
                     on_key(app, shared, audio, key);
                 }
+            }
+        }
+
+        // Scripted QA hook: exit cleanly after the requested duration.
+        if let Some(deadline) = exit_at {
+            if Instant::now() >= deadline {
+                return Ok(());
             }
         }
 
@@ -205,7 +233,7 @@ fn event_loop(
             if app.gram_accum >= GRAM_INTERVAL_SECS {
                 app.gram_accum = 0.0;
                 app.gram.push_back(analysis.spectrum.clone());
-                while app.gram.len() > 512 {
+                while app.gram.len() > GRAM_HISTORY {
                     app.gram.pop_front();
                 }
             }
@@ -327,13 +355,21 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
         title_right.push(Span::styled("\u{266A}", Style::new().fg(beat_color)));
     }
 
+    let mut title_left = vec![Span::styled(
+        " SPECTRUM ",
+        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+    )];
+    if audio.demo {
+        title_left.push(Span::styled(
+            " DEMO ",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(border))
-        .title(Line::from(vec![Span::styled(
-            " SPECTRUM ",
-            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-        )]))
+        .title(Line::from(title_left))
         .title(Line::from(title_right).right_aligned());
     let inner = block.inner(main);
     f.render_widget(block, main);
@@ -417,8 +453,15 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
 
 fn status_line(app: &App, audio: &AudioHandle, accent: Color, flux: f32) -> Line<'static> {
     let dim = Color::Rgb(130, 130, 130);
-    let state = if audio.is_live() {
+    let meta = audio.meta_snapshot();
+    let state = if audio.demo {
         if app.paused {
+            "paused"
+        } else {
+            "demo"
+        }
+    } else if audio.is_live() {
+        if audio.is_paused() {
             "paused"
         } else {
             "capturing"
@@ -431,7 +474,7 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, flux: f32) -> Line
         "playing"
     };
     let icon = match state {
-        "playing" | "capturing" => "\u{bb}",
+        "playing" | "capturing" | "demo" => "\u{bb}",
         "paused" => "\u{2016}",
         _ => "\u{b7}",
     };
@@ -442,11 +485,21 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, flux: f32) -> Line
             Style::new().fg(accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{} ", audio.meta.description),
-            Style::new().fg(Color::White),
+            format!("{} ", meta.description),
+            Style::new().fg(if meta.status == "reconnecting" {
+                Color::Yellow
+            } else {
+                Color::White
+            }),
         ),
     ];
-    if !audio.is_live() {
+    if audio.demo {
+        spans.push(Span::styled(
+            "DEMO \u{b7} silent synthetic ",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !audio.is_live() && !audio.demo {
         spans.push(Span::styled(
             format!("vol {:>3.0}% ", app.volume * 100.0),
             Style::new().fg(dim),
