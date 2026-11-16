@@ -18,9 +18,46 @@ type Stop = (u8, u8, u8);
 /// 4x4 Bayer matrix for ordered dithering; thresholds tile the screen.
 const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
+/// Ordered-dither a single xterm-256 channel within the 6x6x6 cube.
+fn dither_cube_channel(v: u8, th: f32) -> u8 {
+    let f = v as f32 / 51.0;
+    let lo = f.floor();
+    if f - lo > th {
+        (lo as u8 + 1).min(5)
+    } else {
+        lo as u8
+    }
+}
+
 /// Ordered-dither threshold in [0, 1) for a screen position.
 fn bayer_threshold(x: u16, y: u16) -> f32 {
     (BAYER4[(y % 4) as usize][(x % 4) as usize] as f32 + 0.5) / 16.0
+}
+
+/// Ordered-dither one RGB triple for xterm-256. Near-neutral colors use
+/// the finer 24-step grayscale ramp (232..255) instead of the coarse cube,
+/// which smooths the dark ends of gradients like theme shadows.
+fn dither_p256(rgb: [u8; 3], th: f32) -> Color {
+    let [r, g, b] = rgb;
+    let spread = r.max(g).max(b).saturating_sub(r.min(g).min(b));
+    if spread <= 4 {
+        // Grayscale ramp: 24 entries, 8 + 10*i.
+        let avg = ((r as u16 + g as u16 + b as u16) / 3) as u8;
+        let f = (avg.saturating_sub(8) as f32) / 10.0;
+        let lo = f.floor().min(23.0);
+        let idx = if f - lo > th {
+            (lo + 1.0).min(23.0)
+        } else {
+            lo
+        };
+        Color::Indexed(232 + idx as u8)
+    } else {
+        Color::Indexed(
+            16 + 36 * dither_cube_channel(r, th)
+                + 6 * dither_cube_channel(g, th)
+                + dither_cube_channel(b, th),
+        )
+    }
 }
 
 /// Terminal color depth a theme is rendered for.
@@ -174,18 +211,8 @@ impl Theme {
         match self.depth {
             ColorDepth::True => self.at(t),
             ColorDepth::P256 => {
-                let [r, g, b] = to_rgb(sample_stops(self.stops, t));
-                let th = bayer_threshold(x, y);
-                let d = |v: u8| -> u8 {
-                    let f = v as f32 / 51.0;
-                    let lo = f.floor();
-                    if f - lo > th {
-                        (lo as u8 + 1).min(5)
-                    } else {
-                        lo as u8
-                    }
-                };
-                Color::Indexed(16 + 36 * d(r) + 6 * d(g) + d(b))
+                let rgb = to_rgb(sample_stops(self.stops, t));
+                dither_p256(rgb, bayer_threshold(x, y))
             }
             ColorDepth::Ansi16 => {
                 let step = self.gradient_step(t);
@@ -400,6 +427,37 @@ mod tests {
         let a = Color::Rgb(0, 0, 0);
         let b = Color::Rgb(100, 200, 50);
         assert_eq!(lerp_color(a, b, 0.5), Color::Rgb(50, 100, 25));
+    }
+
+    #[test]
+    fn p256_dither_uses_ramp_for_neutral_grays() {
+        // A dark neutral gray below the cube's floor dithers in the
+        // grayscale ramp (232..255), not the cube.
+        let lo = dither_p256([10, 10, 10], 0.1);
+        let hi = dither_p256([10, 10, 10], 0.9);
+        assert!(
+            matches!(lo, Color::Indexed(i) if (232..256).contains(&i)),
+            "{lo:?}"
+        );
+        assert!(
+            matches!(hi, Color::Indexed(i) if (232..256).contains(&i)),
+            "{hi:?}"
+        );
+        assert_ne!(lo, hi, "dithering must vary with threshold");
+
+        // Mid neutral gray: both ends stay in the ramp.
+        let a = dither_p256([139, 138, 137], 0.2);
+        assert!(
+            matches!(a, Color::Indexed(i) if (232..256).contains(&i)),
+            "{a:?}"
+        );
+
+        // Tinted colors stay in the cube (16..232).
+        let tinted = dither_p256([200, 60, 30], 0.5);
+        assert!(
+            matches!(tinted, Color::Indexed(i) if (16..232).contains(&i)),
+            "{tinted:?}"
+        );
     }
 
     #[test]
