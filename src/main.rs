@@ -38,7 +38,7 @@ struct Args {
     #[arg(short, long, default_value = "spectrum")]
     theme: String,
 
-    /// Start visualization in this mode (1-5)
+    /// Start visualization in this mode (1-6)
     #[arg(long)]
     mode: Option<u8>,
 
@@ -50,6 +50,11 @@ struct Args {
     /// (seconds) for deterministic, pixel-identical frames
     #[arg(long)]
     freeze_at: Option<f32>,
+
+    /// With --demo: show this single line in the lyrics garden instead of
+    /// the built-in fixture (local text only; e.g. --demo-lyric hello)
+    #[arg(long)]
+    demo_lyric: Option<String>,
 
     /// Number of frequency bands (8..=256)
     #[arg(long, default_value_t = DEFAULT_BANDS)]
@@ -84,6 +89,9 @@ fn main() -> Result<()> {
         if !secs.is_finite() || secs <= 0.0 {
             bail!("--exit-after must be a positive number of seconds");
         }
+    }
+    if args.demo_lyric.is_some() && !args.demo {
+        bail!("--demo-lyric requires --demo");
     }
     if let Some(t) = args.freeze_at {
         if !args.demo {
@@ -157,6 +165,7 @@ fn main() -> Result<()> {
             &lyrics_shared,
             args.freeze_at.map(|f| f as f64).unwrap_or(0.0),
             args.freeze_at.is_some(),
+            args.demo_lyric.as_deref(),
         );
         let pause = handle.demo_pause.clone().unwrap();
         let media_thread =

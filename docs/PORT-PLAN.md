@@ -25,23 +25,49 @@ replaces the HTML canvas.
   subpixel mask rasterization approach, letter layout/wrap algorithm,
   stem/leaf/rose/petal geometry and its constants, growth/word
   parameters, PRNG, sway/gust math, Paper palette row.
-- **Not copied:** Playfair Display / Georgia font data (see Fonts),
-  GSAP ticker, React UI, demo.gif, Type Garden assets.
+- **Not copied:** GSAP ticker, React UI, demo.gif, Type Garden assets.
 
-## Fonts — the honest constraint
+## Fonts
 
 The reference renders each letter with `ctx.fillText` in
 `700 Playfair Display, Georgia, serif` and measures advances with
-`measureText`. A terminal binary cannot rasterize a system serif
-without bundling a font engine and font data, and we do not ship
-Playfair Display. Instead this port uses **original bitmap serif
-letterforms** (thick stems, thin joins, bracket serifs, lowercase
-x-height/ascender/descender proportions close to Playfair) defined in
-code, with a per-glyph proportional advance table. They are drawn for
-this project and are not extracted from any font file. Expect the
-silhouettes to be recognizably serif but not identical to the
-reference's type; that constraint is documented here rather than
-hidden.
+`measureText`. The port does the same with the genuine font:
+`PlayfairDisplay[wght].ttf` from google/fonts, embedded unmodified
+(SIL OFL 1.1, Reserved Font Name "Playfair Display"; licence file next
+to it, provenance in NOTICE), rasterized by `ab_glyph` (Apache-2.0)
+with the weight axis set to 700 at runtime, so no Modified Version of
+the font is created. Advances and kerning come from the font.
+(An earlier revision used hand-drawn bitmap serifs; that was rejected
+and replaced.)
+
+## Terminal resolution limits (measured, not assumed)
+
+Upstream keeps letters legible by shrinking its cells with the type
+(`targetChT = St/17`, floored at 8 px): about 17 cells per em down to
+that floor. Terminal cells are fixed (a 10x20 px cell in the QA
+screenshots), so:
+
+- Layout searches the line count that maximizes the type size (upstream's
+  own comment: "breaks into more, larger lines instead of two wide, small
+  ones"). Example at 144x42: the fixture line "every beat a budding bloom"
+  wraps to 2 lines at an em of ~8.9 rows; "hello" gets ~24 rows.
+- One glyph per cell (upstream's texture) only forms strokes when an em
+  spans >= ~12 rows; rasterized-pixel inspection showed illegible specks
+  at ~5 rows (a '#' covers ~30% of a cell). Below that the type is drawn
+  as continuous 2x2 quadrant-block silhouettes from the same anti-aliased
+  Playfair coverage, with upstream's type glyph family as a faint
+  ink-on-ink texture in solid cells.
+- Flowers keep a minimum footprint (rose radius >= 2.5 cells, leaf >= 2
+  cells) because their cells cannot shrink either; upstream's chaos knob
+  eases from 0.3 toward its "minimal botanical typography" end for small
+  type so the garden decorates rather than drowns the letters.
+- Upstream's detail thresholds are in canvas pixels (R >= 16 px for
+  outlines etc.); they are converted at its default cell width (~10 px
+  per cell), and its `minLw = cw * 0.5` half-cell minimum stroke is kept.
+- Upstream lays out one line; with wrapped lyrics a front-layer flower may
+  weave over its own line's letters but never another line's (and, for
+  small type, never over any letter) - an extension of its "a flower over
+  the letter body mostly goes behind it" rule.
 
 ## Canvas → terminal geometry
 

@@ -76,6 +76,7 @@ spectrum --demo --mode 4 --exit-after 10  # scripted QA / screenshots
 | `--mode N` | 5 | Start in mode 1-6 (spectrum/scope/spectrogram/combo/mirror/lyrics); the mirrored spectrum is the default composition |
 | `--exit-after SECS` | - | Exit cleanly after N seconds (scripted QA) |
 | `--freeze-at SECS` | - | With `--demo`: pin the synthetic timeline for deterministic, pixel-identical frames |
+| `--demo-lyric TEXT` | - | With `--demo`: show this one line in the lyrics garden instead of the fixture |
 | `-t, --theme NAME` | spectrum | spectrum, fire, ice, matrix, vapor |
 | `--bars N` | 64 | Frequency bands (8..=256) |
 | `--sensitivity F` | 1.0 | FFT display gain (0.1..=4.0, must be finite) |
@@ -125,10 +126,16 @@ The garden is a direct port of the rendering algorithms of
 ridit-jangra/ascii-garden (MIT, (c) 2026 Ridit; notice preserved in
 NOTICE; port map in docs/PORT-PLAN.md), itself a reinterpretation of
 Akshat Agarwal's Type Garden, whose cell-grid ASCII approach comes from
-ascii-animals. Every cell is classified from a subpixel coverage mask
-into glyph families, exactly as upstream. The serif letterforms are
-original bitmaps drawn for this project in Playfair-style proportions
-- no font files are bundled (see docs/PORT-PLAN.md).
+ascii-animals. Every garden cell is classified from a subpixel coverage mask into
+upstream's glyph families. The type is genuine Playfair Display
+(embedded unmodified, SIL OFL 1.1 - see NOTICE) at weight 700, as in
+the reference. Terminal cells cannot shrink the way upstream's do
+(about 17 cells per em), so the layout wraps a lyric line to the
+largest type that fits, and type smaller than about 12 rows per em is
+drawn as continuous quadrant-block silhouettes instead of one glyph per
+cell (which cannot form strokes at that size). Use
+`--demo --mode 6 --demo-lyric hello` to compare a short word with the
+reference.
 
 ## Platform notes
 

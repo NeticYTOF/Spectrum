@@ -20,3 +20,4 @@ Desktop.ini
 # Rust build artifacts
 /target
 shots/
+.qa-local/

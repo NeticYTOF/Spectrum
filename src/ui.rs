@@ -247,37 +247,107 @@ fn event_loop(
             (Arc::clone(&state.latest), beat)
         };
 
-        if beat {
-            app.beat_flash = 1.0;
-        } else {
-            // Exponential decay: ~85% gone after a quarter second.
-            app.beat_flash *= (-BEAT_FLASH_DECAY_PER_SEC * dt).exp();
-            if app.beat_flash < 0.01 {
-                app.beat_flash = 0.0;
-            }
-        }
-
-        // Spectrogram history: newest column on the right, pushed at a
-        // fixed wall-clock cadence regardless of frame rate.
-        if app.mode == Mode::Gram {
-            app.gram_accum += dt;
-            if app.gram_accum >= GRAM_INTERVAL_SECS {
-                app.gram_accum = 0.0;
-                app.gram.push_back(analysis.spectrum.clone());
-                while app.gram.len() > GRAM_HISTORY {
-                    app.gram.pop_front();
-                }
-            }
-        } else {
-            app.gram_accum = GRAM_INTERVAL_SECS;
-        }
-
+        tick_app(app, &analysis, beat, dt);
         terminal.draw(|f| draw(f, app, &analysis, audio, media, lyrics, dt))?;
 
         if app.quit {
             return Ok(());
         }
     }
+}
+
+/// Per-frame state shared by the live loop and headless snapshots: beat
+/// flash decay and the spectrogram history cadence.
+fn tick_app(app: &mut App, analysis: &FrameAnalysis, beat: bool, dt: f32) {
+    if beat {
+        app.beat_flash = 1.0;
+    } else {
+        // Exponential decay: ~85% gone after a quarter second.
+        app.beat_flash *= (-BEAT_FLASH_DECAY_PER_SEC * dt).exp();
+        if app.beat_flash < 0.01 {
+            app.beat_flash = 0.0;
+        }
+    }
+
+    // Spectrogram history: newest column on the right, pushed at a fixed
+    // wall-clock cadence regardless of frame rate.
+    if app.mode == Mode::Gram {
+        app.gram_accum += dt;
+        if app.gram_accum >= GRAM_INTERVAL_SECS {
+            app.gram_accum = 0.0;
+            app.gram.push_back(analysis.spectrum.clone());
+            while app.gram.len() > GRAM_HISTORY {
+                app.gram.pop_front();
+            }
+        }
+    } else {
+        app.gram_accum = GRAM_INTERVAL_SECS;
+    }
+}
+
+/// What a headless snapshot renders: the real `draw` path driven by the
+/// deterministic demo generator, with no terminal or audio hardware.
+pub struct Snapshot<'a> {
+    pub mode: u8,
+    pub theme: &'a str,
+    pub depth: ColorDepth,
+    /// Demo cycle time (seconds) of the final frame.
+    pub at: f32,
+    /// `true`: the timeline is frozen at `at` (what `--freeze-at` shows);
+    /// `false`: the demo plays into `at` for `warmup` seconds.
+    pub frozen: bool,
+    pub warmup: f32,
+    pub lyric: Option<&'a str>,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Render one frame of the real UI into a buffer (headless QA and tests).
+pub fn snapshot(s: &Snapshot<'_>) -> ratatui::buffer::Buffer {
+    use ratatui::backend::TestBackend;
+    let bands = crate::analysis::DEFAULT_BANDS;
+    let shared = Arc::new(Mutex::new(SharedState {
+        latest: Arc::new(crate::demo::synthetic_frame(s.at, bands)),
+        params: crate::analysis::Params {
+            sensitivity: 1.0,
+            fall: 0.12,
+        },
+        beats_pending: 0,
+    }));
+    let audio = AudioHandle::for_demo();
+    let media = crate::media::new_shared();
+    let lyrics = crate::lyrics::new_shared();
+    crate::demo::seed_demo_state(&media, &lyrics, s.at as f64, s.frozen, s.lyric);
+    let mut app = App::new(&shared, &audio, s.theme, s.depth);
+    app.mode = match s.mode {
+        1 => Mode::Bars,
+        2 => Mode::Scope,
+        3 => Mode::Gram,
+        4 => Mode::Combo,
+        5 => Mode::Mirror,
+        _ => Mode::Lyrics,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(s.width, s.height)).expect("test backend");
+    let dt = 1.0 / 60.0;
+    let frames = (s.warmup.max(0.0) / dt).round() as usize + 1;
+    for k in 0..frames {
+        let t = if s.frozen {
+            s.at
+        } else {
+            s.at - (frames - 1 - k) as f32 * dt
+        };
+        let analysis = crate::demo::synthetic_frame(t, bands);
+        if !s.frozen {
+            let mut m = media.lock().unwrap_or_else(|e| e.into_inner());
+            m.position_s = t.max(0.0) as f64;
+        }
+        let beat = analysis.beat && !s.frozen;
+        tick_app(&mut app, &analysis, beat, dt);
+        terminal
+            .draw(|f| draw(f, &mut app, &analysis, &audio, &media, &lyrics, dt))
+            .expect("draw");
+    }
+    terminal.backend().buffer().clone()
 }
 
 fn on_key(app: &mut App, shared: &Arc<Mutex<SharedState>>, audio: &AudioHandle, key: KeyEvent) {
@@ -388,8 +458,15 @@ fn draw(
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
     let main = chunks[0];
     let status_area = chunks[1];
+    let lyrics_mode = mode == Mode::Lyrics;
 
-    let status = status_line(app, audio, accent, status_area.width);
+    // The garden is full-bleed paper like upstream's canvas: no dark frame,
+    // and the status row is restyled in quiet paper tones.
+    let status = if lyrics_mode {
+        status_line_with(app, audio, &StatusPalette::paper(), status_area.width)
+    } else {
+        status_line(app, audio, accent, status_area.width)
+    };
 
     let mut title_right = vec![
         Span::raw(" "),
@@ -409,17 +486,22 @@ fn draw(
     }
 
     let title_width = 4 + mode.name().chars().count() + if audio.demo { 6 } else { 0 };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(border))
-        .title(Line::from(title_left))
-        .title(if area.width as usize > title_width + 12 {
-            Line::from(title_right).right_aligned()
-        } else {
-            Line::from("")
-        });
-    let inner = block.inner(main);
-    f.render_widget(block, main);
+    let inner = if lyrics_mode {
+        main
+    } else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(border))
+            .title(Line::from(title_left))
+            .title(if area.width as usize > title_width + 12 {
+                Line::from(title_right).right_aligned()
+            } else {
+                Line::from("")
+            });
+        let inner = block.inner(main);
+        f.render_widget(block, main);
+        inner
+    };
 
     let App {
         themes,
@@ -475,10 +557,39 @@ fn draw(
             scratch,
         ),
         Mode::Gram => visualizers::render_spectrogram(f.buffer_mut(), inner, gram, theme),
-        Mode::Lyrics => render_lyrics(f.buffer_mut(), inner, app, analysis, media, lyrics, dt),
+        Mode::Lyrics => {
+            render_lyrics(f.buffer_mut(), inner, app, analysis, media, lyrics, dt);
+            if audio.demo && inner.width >= 20 {
+                // Honest synthetic-source label, top-left on the paper.
+                let buf = f.buffer_mut();
+                let tag = "DEMO";
+                for (i, ch) in tag.chars().enumerate() {
+                    if let Some(c) = buf.cell_mut((inner.x + 1 + i as u16, inner.y)) {
+                        c.set_char(ch);
+                        c.set_fg(Color::Rgb(176, 58, 32));
+                        c.set_style(Style::new().add_modifier(Modifier::BOLD));
+                    }
+                }
+            }
+        }
     }
 
-    f.render_widget(Paragraph::new(status), status_area);
+    if lyrics_mode {
+        let paper = Color::Rgb(243, 238, 228);
+        let buf = f.buffer_mut();
+        for x in status_area.x..status_area.x + status_area.width {
+            if let Some(c) = buf.cell_mut((x, status_area.y)) {
+                c.set_char(' ');
+                c.set_bg(paper);
+            }
+        }
+        f.render_widget(
+            Paragraph::new(status).style(Style::new().bg(paper)),
+            status_area,
+        );
+    } else {
+        f.render_widget(Paragraph::new(status), status_area);
+    }
 
     if help {
         let help_area = centered_rect(46, 15, area);
@@ -503,8 +614,46 @@ fn draw(
 /// EVERYTHING fits; otherwise the short "h help \u{b7} q quit" tier takes
 /// precedence over the description and the tuning readouts, so help and
 /// quit stay discoverable at every width.
+/// Colours for the status row (dark chrome, or the garden's paper).
+pub struct StatusPalette {
+    pub accent: Color,
+    pub dim: Color,
+    pub text: Color,
+    pub warn: Color,
+}
+
+impl StatusPalette {
+    fn dark(accent: Color) -> Self {
+        Self {
+            accent,
+            dim: Color::Rgb(130, 130, 130),
+            text: Color::White,
+            warn: Color::Yellow,
+        }
+    }
+
+    fn paper() -> Self {
+        Self {
+            accent: Color::Rgb(28, 43, 143),
+            dim: Color::Rgb(146, 138, 124),
+            text: Color::Rgb(74, 70, 64),
+            warn: Color::Rgb(176, 98, 18),
+        }
+    }
+}
+
 fn status_line(app: &App, audio: &AudioHandle, accent: Color, width: u16) -> Line<'static> {
-    let dim = Color::Rgb(130, 130, 130);
+    status_line_with(app, audio, &StatusPalette::dark(accent), width)
+}
+
+fn status_line_with(
+    app: &App,
+    audio: &AudioHandle,
+    pal: &StatusPalette,
+    width: u16,
+) -> Line<'static> {
+    let accent = pal.accent;
+    let dim = pal.dim;
     let meta = audio.meta_snapshot();
 
     // The chip is the single honest state; the DEMO banner lives in the
@@ -554,7 +703,7 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, width: u16) -> Lin
         (
             Span::styled(
                 format!("{} ", meta.description),
-                Style::new().fg(if warned { Color::Yellow } else { Color::White }),
+                Style::new().fg(if warned { pal.warn } else { pal.text }),
             ),
             2,
         ),
@@ -791,7 +940,7 @@ mod tests {
     fn demo_seed_passes_identity_gate_and_renders_garden() {
         let media = crate::media::new_shared();
         let lyrics = crate::lyrics::new_shared();
-        demo::seed_demo_state(&media, &lyrics, 4.5, true);
+        demo::seed_demo_state(&media, &lyrics, 4.5, true, None);
         let analysis = FrameAnalysis::quiet(64);
         for (w, h) in [(144u16, 42u16), (100, 30), (72, 22)] {
             let mut app = demo_app();
@@ -807,12 +956,17 @@ mod tests {
             let mut stem = 0;
             let mut flower = 0;
             let mut drawn = 0;
+            let dark = |c: Color| matches!(c, Color::Rgb(r, g, b) if (r as u16 + g as u16 + b as u16) < 150);
             for c in buf.content() {
                 if c.symbol() != " " {
                     drawn += 1;
                 }
+                // Type ink: upstream's texture glyphs or silhouette blocks
+                // (dark fg on a quadrant, or dark fill on a solid cell).
+                if dark(c.fg) || dark(c.bg) {
+                    ink += 1;
+                }
                 match c.fg {
-                    Color::Rgb(17, 17, 17) => ink += 1,
                     Color::Rgb(r, _g, b)
                         if b as i32 > r as i32 + 40 && b as i32 > _g as i32 + 20 =>
                     {
@@ -838,7 +992,7 @@ mod tests {
     fn dump_garden_layout() {
         let media = crate::media::new_shared();
         let lyrics = crate::lyrics::new_shared();
-        demo::seed_demo_state(&media, &lyrics, 4.5, true);
+        demo::seed_demo_state(&media, &lyrics, 4.5, true, None);
         for (w, h) in [(144u16, 42u16), (72, 22)] {
             let mut app = demo_app();
             let area = ratatui::layout::Rect::new(0, 0, w, h);
@@ -880,38 +1034,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn dump_letterforms() {
-        // Zoomed letterforms: render a word at a large S directly into a
-        // mask and print the Type role as text art.
-        use crate::garden::font;
-        use crate::garden::mask::{MaskGrid, Role};
-        let word = "garden";
-        let mut g = MaskGrid::new(40, 14);
-        let mut x = 1.0f32;
-        let s = 16.0; // design px; 14 rows = 28 design units tall
-        for ch in word.chars() {
-            font::draw_glyph(&mut g, ch, x, 22.0, s);
-            x += font::advance(ch).unwrap() * s;
-        }
-        for j in 0..g.h {
-            let mut row = String::new();
-            for i in 0..g.w {
-                row.push(if g.role[j * g.w + i] == Role::Type as u8 {
-                    '#'
-                } else {
-                    ' '
-                });
-            }
-            println!("{}", row.trim_end());
-        }
-    }
-
-    #[test]
     fn identity_gate_still_blocks_mismatched_state() {
         let media = crate::media::new_shared();
         let lyrics = crate::lyrics::new_shared();
-        demo::seed_demo_state(&media, &lyrics, 4.5, true);
+        demo::seed_demo_state(&media, &lyrics, 4.5, true, None);
         {
             let mut m = media.lock().unwrap();
             m.title = "Some Other Song".into();

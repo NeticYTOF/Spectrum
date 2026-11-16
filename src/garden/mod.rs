@@ -65,6 +65,9 @@ fn paper_color() -> ratatui::style::Color {
     rgb(PAPER_BG)
 }
 
+/// Minimum em height (terminal rows) for upstream's glyph-texture type.
+pub const TEXTURE_MIN_EM_ROWS: f32 = 12.0;
+
 /// Render the garden into `area` of the terminal buffer.
 pub fn render_garden(buf: &mut Buffer, area: Rect, view: &GardenView<'_>) {
     if area.width < 8 || area.height < 3 {
@@ -209,20 +212,39 @@ fn render_garden_line(buf: &mut Buffer, area: Rect, text: &str, view: &GardenVie
             word_end: data
                 .placements
                 .get(i + 1)
-                .map(|n| n.ch == ' ')
+                .map(|n| n.ch == ' ' || n.line != p.line)
                 .unwrap_or(true),
+            line: p.line,
         })
         .collect();
 
     let mut grid = mask::MaskGrid::new(area.width as usize, area.height as usize);
-    botany::draw_scene(&mut grid, &letters, data.s, age_ms, view.energy, w_design);
+    botany::draw_scene(
+        &mut grid,
+        &letters,
+        &data.type_mask,
+        data.s,
+        age_ms,
+        view.energy,
+        w_design,
+    );
 
     // Present into a scratch buffer over the band, then blit.
     let mut scratch = Buffer::empty(Rect::new(0, 0, area.width, area.height));
+    // Upstream's per-cell texture forms strokes only when a letter spans
+    // enough cells (its own cells shrink to ~17 per em); measured on
+    // rasterized output, ~12 rows per em is where it starts to read.
+    let style = if data.s / 2.0 >= TEXTURE_MIN_EM_ROWS {
+        mask::TypeStyle::Texture
+    } else {
+        mask::TypeStyle::Silhouette
+    };
     mask::present(
         &mut scratch,
         Rect::new(0, 0, area.width, area.height),
         &grid,
+        Some(&data.type_mask),
+        style,
     );
     for row in 0..area.height {
         for col in 0..area.width {
@@ -244,10 +266,12 @@ fn render_garden_line(buf: &mut Buffer, area: Rect, text: &str, view: &GardenVie
     }
 }
 
-/// Layout + garden elements for one line at one size, cached (bounded).
+/// Layout + garden elements + rasterized type for one line at one size,
+/// cached (bounded): the type never animates, only the garden does.
 struct SceneData {
     placements: Vec<layout::Placement>,
     els: Vec<botany::LetterEls>,
+    type_mask: font::TypeMask,
     s: f32,
 }
 
@@ -271,7 +295,15 @@ fn cached_scene(text: &str, cols: u16, rows: u16) -> Rc<SceneData> {
 fn build_scene(text: &str, cols: u16, rows: u16) -> SceneData {
     let w = cols as f32;
     let h = rows as f32 * 2.0;
-    let lay = layout::layout_core(text, w, h, false);
+    let lay = layout::layout(text, w, h);
+    let mut type_mask = font::TypeMask::new(cols as usize * mask::SX, rows as usize * mask::SY);
+    for p in &lay.letters {
+        if p.ch != ' ' {
+            type_mask.current_line = (p.line + 1).min(255) as u8;
+            type_mask.draw_glyph(p.ch, p.tx, p.ty, lay.s, mask::SUB);
+        }
+    }
+    let chaos = botany::chaos_for(lay.s / 2.0);
     let mut els = Vec::with_capacity(lay.letters.len());
     let mut prev_w: Option<f32> = None;
     let mut ws_seed: i32 = 0;
@@ -296,7 +328,7 @@ fn build_scene(text: &str, cols: u16, rows: u16) -> SceneData {
                 .collect();
             ws_seed = hash_str(&word);
         }
-        els.push(botany::gen(p.ch, ws_seed, wi, prev_w));
+        els.push(botany::gen(p.ch, ws_seed, wi, prev_w, chaos));
         // Bridge spans use the previous letter's em advance.
         prev_w = Some(p.tw / lay.s.max(0.01));
         wi += 1;
@@ -304,6 +336,7 @@ fn build_scene(text: &str, cols: u16, rows: u16) -> SceneData {
     SceneData {
         placements: lay.letters,
         els,
+        type_mask,
         s: lay.s,
     }
 }

@@ -65,6 +65,7 @@ pub fn seed_demo_state(
     lyrics: &crate::lyrics::LyricsShared,
     pos: f64,
     paused: bool,
+    custom_lyric: Option<&str>,
 ) {
     let snap = demo_snapshot(pos, paused);
     let key = crate::lyrics::TrackKey::from_snapshot(&snap);
@@ -72,7 +73,21 @@ pub fn seed_demo_state(
     let mut st = lyrics.lock().unwrap_or_else(|e| e.into_inner());
     st.key = key;
     st.generation = st.generation.wrapping_add(1);
-    st.status = crate::lyrics::LyricsStatus::Synced(demo_lyric_lines());
+    st.status = crate::lyrics::LyricsStatus::Synced(demo_lines(custom_lyric));
+}
+
+/// The demo's lyric lines: the original fixture, or - for side-by-side
+/// comparison with the reference (e.g. `--demo-lyric hello`) - a single
+/// caller-supplied line shown for the whole cycle. Either way the text is
+/// local; nothing is fetched.
+pub fn demo_lines(custom: Option<&str>) -> Vec<crate::lrc::LrcLine> {
+    match custom {
+        Some(t) if !t.trim().is_empty() => vec![crate::lrc::LrcLine {
+            time_s: 0.0,
+            text: t.to_string(),
+        }],
+        _ => demo_lyric_lines(),
+    }
 }
 
 /// A demo "media session" thread: publishes the synthetic timeline so the

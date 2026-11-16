@@ -17,6 +17,13 @@ pub const SX: usize = 4;
 pub const SY: usize = 8;
 /// Samples per cell.
 pub const N_SUB: usize = SX * SY;
+/// Subpixels per design unit (square: 4 across a 1.0-wide cell, 8 down a
+/// 2.0-tall one).
+pub const SUB: f32 = SX as f32;
+/// Minimum stroke width in design units: upstream's `minLw = cw * 0.5`
+/// (half a cell) so thin stems still register as a glyph in every cell
+/// they cross instead of breaking into fragments.
+pub const MIN_LW: f32 = 0.5;
 
 /// The reference's "Paper" palette row plus tone derivatives
 /// (shadow = mix toward black 0.46, light = mix toward white 0.42).
@@ -154,25 +161,42 @@ pub struct MaskGrid {
     pub w: usize,
     pub h: usize,
     pub role: Vec<u8>,
+    /// Which type line (index + 1) owns each type subpixel; 0 = none.
+    pub owner: Vec<u8>,
+    /// While drawing a front-layer element of line `guard - 1`, other
+    /// lines' letters are protected (0 = no guard). Upstream lays out one
+    /// line and sends flowers over the letter body mostly behind it; with
+    /// wrapped lyrics the same rule extends to every other line.
+    pub guard: u8,
 }
 
 impl MaskGrid {
     pub fn new(cols: usize, rows: usize) -> Self {
+        let n = cols * SX * rows * SY;
         Self {
             w: cols * SX,
             h: rows * SY,
-            role: vec![0; cols * SX * rows * SY],
+            role: vec![0; n],
+            owner: vec![0; n],
+            guard: 0,
         }
     }
 
     pub fn clear(&mut self) {
         self.role.fill(0);
+        self.owner.fill(0);
+        self.guard = 0;
     }
 
     #[inline]
     fn set(&mut self, i: usize, j: usize, role: Role) {
         if i < self.w && j < self.h {
-            self.role[j * self.w + i] = role as u8;
+            let k = j * self.w + i;
+            let o = self.owner[k];
+            if self.guard != 0 && o != 0 && o != self.guard {
+                return;
+            }
+            self.role[k] = role as u8;
         }
     }
 
@@ -259,7 +283,7 @@ impl MaskGrid {
         if pts.len() < 2 || w <= 0.0 {
             return;
         }
-        let half = w / 2.0;
+        let half = w.max(MIN_LW) / 2.0;
         let (x0, y0, x1, y1) = poly_bbox(pts);
         let (i0, j0, i1, j1) = self.bbox_sub(x0 - half, y0 - half, x1 + half, y1 + half);
         for j in j0..j1 {
@@ -368,11 +392,137 @@ fn color_at(stops: &[(f32, (u8, u8, u8))], t: f32) -> (u8, u8, u8) {
     stops[stops.len() - 1].1
 }
 
+/// How the type layer is turned into cells.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeStyle {
+    /// Upstream's per-cell glyph texture (ascii.ts present), used when a
+    /// letter spans enough cells for the texture to form strokes.
+    Texture,
+    /// Continuous silhouettes from 2x2 quadrant blocks over the same
+    /// anti-aliased Playfair coverage, with upstream's type glyph family
+    /// as a faint ink-on-ink texture in solid cells. Used for smaller
+    /// type, where one glyph per cell cannot draw a stroke.
+    Silhouette,
+}
+
+/// Near-black ink for silhouette type (upstream text #111111, a touch
+/// softer so solid letters don't read as holes in the paper).
+pub const INK: (u8, u8, u8) = (24, 23, 21);
+
+/// Quadrant block for a TL/TR/BL/BR on-mask (bit 0 = TL ... bit 3 = BR).
+fn quadrant_char(bits: u8) -> char {
+    match bits {
+        0b0001 => '\u{2598}',
+        0b0010 => '\u{259D}',
+        0b0100 => '\u{2596}',
+        0b1000 => '\u{2597}',
+        0b0011 => '\u{2580}',
+        0b1100 => '\u{2584}',
+        0b0101 => '\u{258C}',
+        0b1010 => '\u{2590}',
+        0b1001 => '\u{259A}',
+        0b0110 => '\u{259E}',
+        0b0111 => '\u{259B}',
+        0b1011 => '\u{259C}',
+        0b1101 => '\u{2599}',
+        0b1110 => '\u{259F}',
+        _ => '\u{2588}',
+    }
+}
+
+type Rgb = (u8, u8, u8);
+
+/// One silhouette cell, or None when no quadrant carries type. Quadrant
+/// coverage only counts subpixels whose FINAL role is type, so front-layer
+/// flowers still occlude the letters exactly as upstream layers them.
+fn silhouette_cell(
+    grid: &MaskGrid,
+    type_cov: &super::font::TypeMask,
+    gi0: usize,
+    gj0: usize,
+    key: u32,
+    colors: &[(u8, u8, u8); ROLE_COUNT],
+) -> Option<(char, Rgb, Rgb)> {
+    let mut cov = [0f32; 4];
+    let mut other = [[0u16; ROLE_COUNT]; 4];
+    for j in 0..SY {
+        for i in 0..SX {
+            let (gi, gj) = (gi0 + i, gj0 + j);
+            if gi >= grid.w || gj >= grid.h {
+                continue;
+            }
+            let q = (i / (SX / 2)) + 2 * (j / (SY / 2));
+            let r = grid.role[gj * grid.w + gi] as usize;
+            if r == Role::Type as usize {
+                cov[q] += type_cov.at(gi, gj) as f32 / 255.0;
+            } else {
+                other[q][r] += 1;
+            }
+        }
+    }
+    let per_q = (SX / 2 * SY / 2) as f32;
+    let mut bits = 0u8;
+    let (mut on_sum, mut on_n) = (0f32, 0f32);
+    for (q, c) in cov.iter_mut().enumerate() {
+        *c /= per_q;
+        if *c >= 0.4 {
+            bits |= 1 << q;
+            on_sum += *c;
+            on_n += 1.0;
+        }
+    }
+    if bits == 0 {
+        return None;
+    }
+    // Anti-aliasing through colour: partially covered quadrants pull the
+    // ink toward the paper, fully covered ones stay dark.
+    let on_cov = (on_sum / on_n).clamp(0.0, 1.0);
+    let ink = mix(PAPER_BG, INK, (0.35 + 0.65 * on_cov).min(1.0));
+    if bits == 0b1111 {
+        // Solid: ink fill, upstream's type glyph family as a faint texture.
+        let set = SETS[Role::Type as usize];
+        let ch = set
+            .chars()
+            .nth(((key >> 8) % set.chars().count() as u32) as usize)
+            .unwrap_or('#');
+        return Some((ch, mix(ink, PAPER_BG, 0.13), ink));
+    }
+    // The off quadrants show whatever is behind the type there: paper, or
+    // the dominant garden role's fill.
+    let mut tally = [0u16; ROLE_COUNT];
+    for (q, o) in other.iter().enumerate() {
+        if bits & (1 << q) == 0 {
+            for (k, n) in o.iter().enumerate() {
+                tally[k] += n;
+            }
+        }
+    }
+    let mut dom = 0;
+    for k in 1..ROLE_COUNT {
+        if tally[k] > tally[dom] {
+            dom = k;
+        }
+    }
+    let back = if dom == 0 || tally[dom] < 4 {
+        PAPER_BG
+    } else {
+        mix(colors[dom], PAPER_BG, 0.2)
+    };
+    Some((quadrant_char(bits), ink, back))
+}
+
 /// Read the mask back and turn it into terminal cells (ascii.ts present()).
 /// Solid cells get a fill background plus a dense glyph; soft cells get a
 /// faded glyph on the paper; the texture is stable per cell (hash3), the
-/// geometry supplies the animation.
-pub fn present(buf: &mut Buffer, area: Rect, grid: &MaskGrid) {
+/// geometry supplies the animation. With [`TypeStyle::Silhouette`] the
+/// type layer is drawn as continuous quadrant silhouettes instead.
+pub fn present(
+    buf: &mut Buffer,
+    area: Rect,
+    grid: &MaskGrid,
+    type_cov: Option<&super::font::TypeMask>,
+    style: TypeStyle,
+) {
     let min_hits = ((N_SUB as f32 * 0.125).round() as usize).max(1); // 4 of 32
     let sec_hits = ((N_SUB as f32 * 0.17).round() as usize).max(1); // 5 of 32
     let colors: [(u8, u8, u8); ROLE_COUNT] = {
@@ -423,8 +573,23 @@ pub fn present(buf: &mut Buffer, area: Rect, grid: &MaskGrid) {
                     sxy[r] += px * py;
                 }
             }
-            let total: u16 = count[1..].iter().sum();
             let cell = buf.cell_mut(Position::new(cx, cy)).unwrap();
+            if style == TypeStyle::Silhouette && count[Role::Type as usize] > 0 {
+                if let Some(tc) = type_cov {
+                    let key = (hash3((cx - area.x) as i32, (cy - area.y) as i32, 17) * 4294967295.0)
+                        as u32;
+                    if let Some((ch, fg, bg)) = silhouette_cell(grid, tc, gi0, gj0, key, &colors) {
+                        cell.set_char(ch);
+                        cell.set_fg(rgb(fg));
+                        cell.set_bg(rgb(bg));
+                        continue;
+                    }
+                    // Below every quadrant threshold: a faint hairline; let
+                    // the garden (if any) speak for this cell instead.
+                    count[Role::Type as usize] = 0;
+                }
+            }
+            let total: u16 = count[1..].iter().sum();
             if (total as usize) < min_hits {
                 continue; // paper
             }
@@ -628,7 +793,7 @@ mod tests {
         });
         let area = Rect::new(0, 0, 2, 1);
         let mut buf = Buffer::empty(area);
-        present(&mut buf, area, &g);
+        present(&mut buf, area, &g, None, TypeStyle::Texture);
         let cell = &buf[(0, 0)];
         assert_ne!(cell.symbol(), " ");
         let stem_mix = mix(STEM, PAPER_BG, 0.2);
@@ -651,7 +816,7 @@ mod tests {
         });
         let area = Rect::new(0, 0, 2, 1);
         let mut buf = Buffer::empty(area);
-        present(&mut buf, area, &g);
+        present(&mut buf, area, &g, None, TypeStyle::Texture);
         let cell = &buf[(0, 0)];
         assert_ne!(cell.symbol(), " ");
         assert_eq!(cell.bg, ratatui::style::Color::Rgb(243, 238, 228));
@@ -670,7 +835,7 @@ mod tests {
         });
         let area = Rect::new(0, 0, 1, 1);
         let mut buf = Buffer::empty(area);
-        present(&mut buf, area, &g);
+        present(&mut buf, area, &g, None, TypeStyle::Texture);
         assert_eq!(buf[(0, 0)].symbol(), " ");
     }
 

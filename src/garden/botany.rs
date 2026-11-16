@@ -10,6 +10,19 @@ use super::mask::{MaskGrid, Pt, Role, FLOWER};
 
 pub const CHAOS: f32 = 0.3; // "0.3 matches the original Type Garden"
 
+/// Upstream detail thresholds are in canvas pixels at its default cell
+/// size (about 10 px wide); design units here are one cell wide, so a
+/// pixel constant converts by this factor (R >= 16 px -> R >= 1.6).
+const PX: f32 = 0.1;
+
+/// Terminal cells cannot shrink with the flowers the way upstream's do
+/// (`targetCh = St/17`), so a rose keeps a minimum footprint of about
+/// five cells across / two-and-a-half rows to stay recognizable, and a
+/// leaf about two cells. Upstream roses at its default size are larger
+/// than this, so the floor only engages for small type.
+const ROSE_MIN_R: f32 = 2.5;
+const LEAF_MIN_L: f32 = 2.0;
+
 /// The reference PRNG (garden.ts rng): sfc-style with a 0x6D2B79F5 step.
 /// Runs in u32 because the JS uses `>>>` (logical shifts) throughout.
 pub struct Rng(i32);
@@ -182,9 +195,18 @@ pub struct WordParams {
     pub w: f32,
 }
 
-pub fn word_params(ws: i32) -> WordParams {
+/// Upstream's chaos knob for a given type size: 0.3 ("matches the
+/// original Type Garden") once an em spans ~9 rows, easing down toward
+/// upstream's "minimal botanical typography" end for small type so the
+/// garden decorates the letters instead of drowning them.
+pub fn chaos_for(em_rows: f32) -> f32 {
+    let t = ((em_rows - 4.5) / 4.5).clamp(0.0, 1.0);
+    0.12 + (CHAOS - 0.12) * t
+}
+
+pub fn word_params(ws: i32, chaos: f32) -> WordParams {
     let mut r = Rng::new(ws.wrapping_mul(7).wrapping_add(13));
-    let c = CHAOS;
+    let c = chaos;
     // The reference theme is "botanical": tipP = 1, leaf = 1.
     let dens = 1.0 * (0.25 + c * 2.4) / 0.97;
     WordParams {
@@ -460,13 +482,13 @@ fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, o: GrowOp
 /// The elements of one letter (garden.ts gen, deterministically seeded:
 /// the reference's Math.random component is replaced by the word seed so
 /// a frozen frame is reproducible).
-pub fn gen(ch: char, ws: i32, wi: usize, prev_w: Option<f32>) -> LetterEls {
+pub fn gen(ch: char, ws: i32, wi: usize, prev_w: Option<f32>, chaos: f32) -> LetterEls {
     let mut r = Rng::new(
         ws ^ ((wi as i32)
             .wrapping_add(1)
             .wrapping_mul(2654435761u32 as i32)),
     );
-    let p = word_params(ws);
+    let p = word_params(ws, chaos);
     let w = super::font::advance(ch).unwrap_or(0.5);
     let mut els: Vec<El> = Vec::new();
     let mut nid: u32 = 0;
@@ -655,7 +677,7 @@ fn wpt(lx: f32, ly: f32, x: f32, y: f32, s: f32, w_design: f32, t_s: f32) -> P {
 
 /// Two-tone leaf with a light midrib (garden.ts leaf), design units.
 fn draw_leaf(g: &mut MaskGrid, bx: f32, by: f32, a: f32, len: f32, bend: f32) {
-    if len < 0.5 {
+    if len < 0.5 * PX {
         return;
     }
     let ca = a.cos();
@@ -687,14 +709,17 @@ fn draw_leaf(g: &mut MaskGrid, bx: f32, by: f32, a: f32, len: f32, bend: f32) {
     half2.extend(s2[1..n].iter().rev().map(|&(x, y)| Pt(x, y)));
     half2.push(Pt(base.0, base.1));
     g.fill_poly(&half2, Role::LeafShadow);
-    if len > 14.0 {
+    // Upstream ribs leaves over 14 px; at terminal resolution the
+    // half-cell minimum line width would swallow a small leaf, so the
+    // rib appears only once the leaf is wide enough to carry it.
+    if len > 14.0 * PX && len * 0.18 > super::mask::MIN_LW * 1.2 {
         let rib: Vec<Pt> = (1..=8)
             .map(|i| {
                 let (x, y) = ax(0.06 + 0.74 * i as f32 / 8.0);
                 Pt(x, y)
             })
             .collect();
-        g.stroke_polyline(&rib, (0.8_f32).max(len * 0.03), Role::LeafLight);
+        g.stroke_polyline(&rib, (0.8 * PX).max(len * 0.03), Role::LeafLight);
     }
 }
 
@@ -712,7 +737,7 @@ fn draw_rose(
     turns: f32,
     age_ms: f32,
 ) {
-    if r < 0.8 {
+    if r < 0.8 * PX {
         return;
     }
     let cr = rot.cos();
@@ -727,7 +752,7 @@ fn draw_rose(
         [0.47, 0.30, 0.62, 0.48, -0.2, 0.12, 1.0],
         [0.05, 0.42, 0.56, 0.38, 0.0, 0.14, 0.0],
     ];
-    let lw = (0.8_f32).max(r * 0.045);
+    let lw = (0.8 * PX).max(r * 0.045);
     let flower_cands = [Role::Flower, Role::FlowerLight, Role::FlowerShadow];
     let light = super::mask::role_color(Role::FlowerLight);
     let base_col = FLOWER;
@@ -779,10 +804,10 @@ fn draw_rose(
             &stops,
             &flower_cands,
         );
-        if r >= 16.0 && s > 0.5 {
+        if r >= 16.0 * PX && s > 0.5 {
             g.outline_poly(&pts, lw * 0.6, Role::FlowerShadow);
         }
-        if q[6] > 0.5 && r >= 12.0 && s > 0.4 {
+        if q[6] > 0.5 && r >= 12.0 * PX && s > 0.4 {
             let arc: Vec<Pt> = (0..=14)
                 .map(|k| pt(std::f32::consts::PI * (1.18 + 0.64 * k as f32 / 14.0)))
                 .collect();
@@ -791,10 +816,10 @@ fn draw_rose(
     }
     // Spiral and sepal lines (garden.ts rose tail).
     let fr = eo((age_ms - 6.0 * 85.0 - 80.0) / 520.0);
-    if fr > 0.0 && r > 3.0 {
-        let turns_eff = if r < 20.0 {
+    if fr > 0.0 && r > 3.0 * PX {
+        let turns_eff = if r < 20.0 * PX {
             turns.min(1.3)
-        } else if r < 32.0 {
+        } else if r < 32.0 * PX {
             turns * 0.8
         } else {
             turns
@@ -808,7 +833,7 @@ fn draw_rose(
             })
             .collect();
         g.stroke_range(&sp, 0.0, fr, lw, Role::Line);
-        if r >= 14.0 {
+        if r >= 14.0 * PX {
             let scl: Vec<Pt> = (0..=36)
                 .map(|i| {
                     let u = i as f32 / 36.0;
@@ -837,19 +862,26 @@ pub struct SceneLetter<'a> {
     /// True when the next letter is a space or this is the last letter:
     /// the reference draws the end-of-word tendril only here.
     pub word_end: bool,
+    /// Wrapped line index (front-layer elements may cover only their own
+    /// line's letters).
+    pub line: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn draw_scene(
     g: &mut MaskGrid,
     letters: &[SceneLetter<'_>],
+    type_mask: &super::font::TypeMask,
     s: f32,
     age_ms: f32,
     energy: f32,
     w_design: f32,
 ) {
-    let chaos = CHAOS;
-    let amp = (0.8f32).max(s * 0.01) * (0.55 + chaos * 2.4) * (0.55 + 0.9 * energy.clamp(0.0, 1.0));
+    let chaos = chaos_for(s / 2.0);
+    // Upstream boil: max(0.8 px, S * 0.01) scaled by chaos; the music's
+    // smoothed energy modulates it gently (calm in quiet passages).
+    let amp =
+        (0.8 * PX).max(s * 0.01) * (0.55 + chaos * 2.4) * (0.6 + 0.8 * energy.clamp(0.0, 1.0));
     let f = age_ms / 420.0;
     let t_s = age_ms / 1000.0;
 
@@ -935,7 +967,7 @@ pub fn draw_scene(
                     return;
                 }
                 let (wx, wy) = wpt(x0, y0, x0 + x * s + j.0, y0 + y * s + j.1, s, w_design, t_s);
-                draw_leaf(g, wx, wy, a + j.2, len * s * sc, *bend);
+                draw_leaf(g, wx, wy, a + j.2, (len * s).max(LEAF_MIN_L) * sc, *bend);
             }
             El::Rose {
                 x,
@@ -953,7 +985,17 @@ pub fn draw_scene(
                     return;
                 }
                 let (wx, wy) = wpt(x0, y0, x0 + x * s + j.0, y0 + y * s + j.1, s, w_design, t_s);
-                draw_rose(g, wx, wy, r * s, rot + j.2, *ph1, *ph2, *turns, a);
+                draw_rose(
+                    g,
+                    wx,
+                    wy,
+                    (r * s).max(ROSE_MIN_R),
+                    rot + j.2,
+                    *ph1,
+                    *ph2,
+                    *turns,
+                    a,
+                );
             }
         }
     };
@@ -975,12 +1017,28 @@ pub fn draw_scene(
             }
         }
     }
-    // The type.
-    for l in letters {
-        super::font::draw_glyph(g, l.ch, l.tx, l.ty, s);
+    // The type: the cached anti-aliased Playfair mask, thresholded at half
+    // coverage - the point where a canvas edge pixel's colour turns
+    // nearer the type role than the paper in upstream's 15-bit LUT.
+    if type_mask.w == g.w && type_mask.h == g.h {
+        for (k, &c) in type_mask.cov.iter().enumerate() {
+            if c >= 128 {
+                g.role[k] = Role::Type as u8;
+                g.owner[k] = type_mask.line.get(k).copied().unwrap_or(1);
+            }
+        }
     }
-    // Front layer.
+    // Front layer: each element is guarded so it may weave over its own
+    // line's letters but never over another line's. Small type (an em
+    // under ~8 rows) cannot afford any occlusion, so there every letter
+    // is protected and the whole garden sits behind the type.
+    let protect_all = s / 2.0 < 8.0;
     for l in letters {
+        g.guard = if protect_all {
+            255
+        } else {
+            (l.line + 1).min(254) as u8
+        };
         let age = age_ms - l.birth_ms;
         for el in &l.els.els {
             draw_el(g, l, el, age, 1);
@@ -994,6 +1052,7 @@ pub fn draw_scene(
             }
         }
     }
+    g.guard = 0;
 }
 
 #[cfg(test)]
@@ -1026,15 +1085,15 @@ mod tests {
 
     #[test]
     fn gen_is_deterministic_and_produces_elements() {
-        let a = gen('g', 12345, 0, Some(0.5));
-        let b = gen('g', 12345, 0, Some(0.5));
+        let a = gen('g', 12345, 0, Some(0.5), CHAOS);
+        let b = gen('g', 12345, 0, Some(0.5), CHAOS);
         assert_eq!(format!("{:?}", a.els.len()), format!("{:?}", b.els.len()));
         assert!(!a.els.is_empty(), "a letter must grow something");
-        let rose_first = gen('s', 999, 0, None);
+        let rose_first = gen('s', 999, 0, None, CHAOS);
         // First letter of a word starts with a rose-tipped stem.
         assert!(matches!(rose_first.els[0], El::Stem { .. }));
         // Different seeds give different gardens.
-        let c = gen('g', 54321, 0, Some(0.5));
+        let c = gen('g', 54321, 0, Some(0.5), CHAOS);
         assert!(
             format!("{:?}", a.els) != format!("{:?}", c.els),
             "seeds must vary the garden"
@@ -1063,7 +1122,7 @@ mod tests {
     #[test]
     fn draw_scene_paints_type_stems_and_roses() {
         use super::super::mask::{Role, N_SUB};
-        let els = gen('o', 4242, 0, None);
+        let els = gen('o', 4242, 0, None, CHAOS);
         let letters = [SceneLetter {
             ch: 'o',
             tx: 4.0,
@@ -1071,9 +1130,12 @@ mod tests {
             els: &els,
             birth_ms: 0.0,
             word_end: true,
+            line: 0,
         }];
         let mut g = MaskGrid::new(12, 8);
-        draw_scene(&mut g, &letters, 8.0, 5000.0, 0.3, 12.0);
+        let mut tm = super::super::font::TypeMask::new(g.w, g.h);
+        tm.draw_glyph('o', 4.0, 6.0, 8.0, 4.0);
+        draw_scene(&mut g, &letters, &tm, 8.0, 5000.0, 0.3, 12.0);
         let roles = g.role.clone();
         let type_n = roles.iter().filter(|&&r| r == Role::Type as u8).count();
         let stem_n = roles.iter().filter(|&&r| r == Role::Stem as u8).count();
