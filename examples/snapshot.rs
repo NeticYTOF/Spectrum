@@ -281,4 +281,22 @@ fn main() {
     }
     img.save_bmp(&out).expect("write bmp");
     println!("wrote {out} ({}x{} px, {w}x{h} cells)", img.w, img.h);
+    if args.iter().any(|a| a == "--colors-report") {
+        // Distinct fg/bg colours with counts: a cheap check that shading
+        // roles (shadow / base / highlight / line) all reach the screen.
+        let mut tally: std::collections::BTreeMap<(String, String), usize> = Default::default();
+        for c in buf.content() {
+            if c.symbol() == " " {
+                continue;
+            }
+            *tally
+                .entry((format!("{:?}", c.fg), format!("{:?}", c.bg)))
+                .or_default() += 1;
+        }
+        let mut v: Vec<_> = tally.into_iter().collect();
+        v.sort_by_key(|e| std::cmp::Reverse(e.1));
+        for ((fg, bg), n) in v.into_iter().take(28) {
+            println!("{n:5}  fg {fg:<24} bg {bg}");
+        }
+    }
 }

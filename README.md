@@ -13,19 +13,26 @@ with Unicode blocks, braille dots and ANSI color.
 
 ## Features
 
-- **Spectrum analyzer** - log-spaced frequency bars with partial-block
-  tops and peak-hold caps
-- **Oscilloscope** - phase-triggered braille waveform (2x4 dot
-  resolution per cell)
-- **Spectrogram** - scrolling frequency heatmap, newest at the right edge
-- **Bars + Wave** - oscilloscope overlaid on the spectrum bars
-- **Mirrored spectrum** - bars growing outward from a center line
+- **Spectrum** (1) - separated log-frequency bars with eighth-block
+  anti-aliased tops, gravity peak caps and a true frequency axis
+- **Oscilloscope** (2) - phase-triggered, connected braille trace with
+  time-based phosphor persistence over a quiet graticule
+- **Waterfall** (3) - scrolling spectrogram, two frequency rows per
+  cell (half blocks with independent colours), frequency labels
+- **Radial** (4) - spectrum petals as solid wedges around a waveform
+  ring that breathes with the music
+- **Mirror** (5, default) - centre-out symmetric bars (bass in the
+  middle) mirrored around a centre line with a dimmer reflection
 - **Lyrics garden** - synced lyrics (LRCLIB, community-sourced) as an
   ASCII garden: the current line in serif type with curling stems,
   leaves and shaded roses growing out of the letters, driven by Windows
   SMTC metadata; honest states for unsynced/instrumental/no-match/
   offline, normal-text fallback for unsupported scripts
-- **Beat detection** - spectral flux drives a border/`♪` flash
+- **Beat detection** - spectral flux drives a glowing beat dot in the
+  header
+- **Motion** - attack/release display smoothing, gravity peaks and
+  phosphor decay are all time-based, so motion is identical at any
+  frame rate
 - **Color themes** - spectrum, fire, ice, matrix, vapor; gradients get a
   deliberate ordered-stipple dither between steps (visible in truecolor,
   consistent in 256/16)
@@ -73,7 +80,7 @@ spectrum --demo --mode 4 --exit-after 10  # scripted QA / screenshots
 | `-c, --capture` | - | Visualize live audio (see `--source`) |
 | `--demo` | off | Silent synthetic generator; no audio hardware |
 | `--source NAME` | system | `system` (Windows output loopback) or `mic` |
-| `--mode N` | 5 | Start in mode 1-6 (spectrum/scope/spectrogram/combo/mirror/lyrics); the mirrored spectrum is the default composition |
+| `--mode N` | 5 | Start in mode 1-6 (spectrum/oscilloscope/waterfall/radial/mirror/lyrics); the mirror is the default composition |
 | `--exit-after SECS` | - | Exit cleanly after N seconds (scripted QA) |
 | `--freeze-at SECS` | - | With `--demo`: pin the synthetic timeline for deterministic, pixel-identical frames |
 | `--demo-lyric TEXT` | - | With `--demo`: show this one line in the lyrics garden instead of the fixture |
@@ -94,7 +101,7 @@ device and any reconnect state).
 
 | Key | Action |
 |---|---|
-| `1`-`6` | spectrum / oscilloscope / spectrogram / combo / mirror / lyrics garden |
+| `1`-`6` | spectrum / oscilloscope / waterfall / radial / mirror / lyrics garden |
 | `Tab` / `Shift+Tab` | cycle visualizations |
 | `Space` | pause / resume audio |
 | `Up` / `Down` | volume (file mode) |

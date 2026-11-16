@@ -28,7 +28,7 @@ pub enum Mode {
     Bars,
     Scope,
     Gram,
-    Combo,
+    Radial,
     Mirror,
     Lyrics,
 }
@@ -36,11 +36,11 @@ pub enum Mode {
 impl Mode {
     pub fn name(self) -> &'static str {
         match self {
-            Mode::Bars => "Spectrum Analyzer",
+            Mode::Bars => "Spectrum",
             Mode::Scope => "Oscilloscope",
-            Mode::Gram => "Spectrogram",
-            Mode::Combo => "Bars + Wave",
-            Mode::Mirror => "Mirrored Spectrum",
+            Mode::Gram => "Waterfall",
+            Mode::Radial => "Radial",
+            Mode::Mirror => "Mirror",
             Mode::Lyrics => "Lyrics Garden",
         }
     }
@@ -49,8 +49,8 @@ impl Mode {
         match self {
             Mode::Bars => Mode::Scope,
             Mode::Scope => Mode::Gram,
-            Mode::Gram => Mode::Combo,
-            Mode::Combo => Mode::Mirror,
+            Mode::Gram => Mode::Radial,
+            Mode::Radial => Mode::Mirror,
             Mode::Mirror => Mode::Lyrics,
             Mode::Lyrics => Mode::Bars,
         }
@@ -61,12 +61,29 @@ impl Mode {
             Mode::Bars => Mode::Lyrics,
             Mode::Scope => Mode::Bars,
             Mode::Gram => Mode::Scope,
-            Mode::Combo => Mode::Gram,
-            Mode::Mirror => Mode::Combo,
+            Mode::Radial => Mode::Gram,
+            Mode::Mirror => Mode::Radial,
             Mode::Lyrics => Mode::Mirror,
         }
     }
+
+    fn from_number(m: u8) -> Self {
+        match m {
+            1 => Mode::Bars,
+            2 => Mode::Scope,
+            3 => Mode::Gram,
+            4 => Mode::Radial,
+            5 => Mode::Mirror,
+            _ => Mode::Lyrics,
+        }
+    }
 }
+
+/// Display smoothing time constants (seconds): a fast attack keeps hits
+/// crisp, a slower release lets bars settle without jitter. Applied with
+/// the real frame time, so motion is frame-rate independent.
+const ATTACK_TAU: f32 = 0.022;
+const RELEASE_TAU: f32 = 0.14;
 
 /// Beat-flash exponential decay rate (fraction e^-kt remaining after t).
 const BEAT_FLASH_DECAY_PER_SEC: f32 = 8.0;
@@ -84,7 +101,11 @@ pub struct App {
     pub sensitivity: f32,
     pub fall: f32,
     pub volume: f32,
-    peaks: Vec<f32>,
+    peaks: visualizers::Peaks,
+    /// Attack/release-smoothed bars for the bar-based modes.
+    display: Vec<f32>,
+    /// Smoothed spectral flux (radial ring breathing).
+    flux: f32,
     gram: VecDeque<Vec<f32>>,
     gram_accum: f32,
     last_frame: Instant,
@@ -123,7 +144,9 @@ impl App {
             sensitivity: state.params.sensitivity,
             fall: state.params.fall,
             volume,
-            peaks: Vec::new(),
+            peaks: visualizers::Peaks::new(),
+            display: Vec::new(),
+            flux: 0.0,
             gram: VecDeque::with_capacity(GRAM_HISTORY + 16),
             gram_accum: 0.0,
             last_frame: Instant::now(),
@@ -175,14 +198,7 @@ pub fn run(cfg: RunConfig<'_>) -> Result<()> {
 
         let mut app = App::new(shared, audio, theme_name, depth);
         if let Some(m) = start_mode {
-            app.mode = match m {
-                1 => Mode::Bars,
-                2 => Mode::Scope,
-                3 => Mode::Gram,
-                4 => Mode::Combo,
-                5 => Mode::Mirror,
-                _ => Mode::Lyrics,
-            };
+            app.mode = Mode::from_number(m);
         }
         let started = Instant::now();
         let r = event_loop(
@@ -259,6 +275,18 @@ fn event_loop(
 /// Per-frame state shared by the live loop and headless snapshots: beat
 /// flash decay and the spectrogram history cadence.
 fn tick_app(app: &mut App, analysis: &FrameAnalysis, beat: bool, dt: f32) {
+    // Attack/release display smoothing.
+    if app.display.len() != analysis.bars.len() {
+        app.display = analysis.bars.clone();
+    }
+    let ka = 1.0 - (-dt / ATTACK_TAU).exp();
+    let kr = 1.0 - (-dt / RELEASE_TAU).exp();
+    for (d, &v) in app.display.iter_mut().zip(analysis.bars.iter()) {
+        let k = if v > *d { ka } else { kr };
+        *d += (v - *d) * k;
+    }
+    app.flux += (analysis.flux - app.flux) * (1.0 - (-dt / 0.12).exp());
+
     if beat {
         app.beat_flash = 1.0;
     } else {
@@ -319,14 +347,7 @@ pub fn snapshot(s: &Snapshot<'_>) -> ratatui::buffer::Buffer {
     let lyrics = crate::lyrics::new_shared();
     crate::demo::seed_demo_state(&media, &lyrics, s.at as f64, s.frozen, s.lyric);
     let mut app = App::new(&shared, &audio, s.theme, s.depth);
-    app.mode = match s.mode {
-        1 => Mode::Bars,
-        2 => Mode::Scope,
-        3 => Mode::Gram,
-        4 => Mode::Combo,
-        5 => Mode::Mirror,
-        _ => Mode::Lyrics,
-    };
+    app.mode = Mode::from_number(s.mode);
     let mut terminal = Terminal::new(TestBackend::new(s.width, s.height)).expect("test backend");
     let dt = 1.0 / 60.0;
     let frames = (s.warmup.max(0.0) / dt).round() as usize + 1;
@@ -367,7 +388,7 @@ fn on_key(app: &mut App, shared: &Arc<Mutex<SharedState>>, audio: &AudioHandle, 
         KeyCode::Char('1') => set_mode(app, Mode::Bars),
         KeyCode::Char('2') => set_mode(app, Mode::Scope),
         KeyCode::Char('3') => set_mode(app, Mode::Gram),
-        KeyCode::Char('4') => set_mode(app, Mode::Combo),
+        KeyCode::Char('4') => set_mode(app, Mode::Radial),
         KeyCode::Char('5') => set_mode(app, Mode::Mirror),
         KeyCode::Char('6') => set_mode(app, Mode::Lyrics),
         KeyCode::Tab => set_mode(app, app.mode.next()),
@@ -445,62 +466,48 @@ fn draw(
     let theme_idx = app.theme_idx;
     let beat_flash = app.beat_flash;
     let help = app.help;
-
-    // Quiet chrome: the visualization is the star. The border sits at a
-    // low-contrast slate and only flashes toward the theme on beats; the
-    // status chip keeps the single accent pop.
-    let chrome = Color::Rgb(150, 152, 162);
-    let slate_border = Color::Rgb(70, 74, 86);
     let accent = app.themes[theme_idx].accent();
-    let beat_color = app.themes[theme_idx].beat();
-    let border = theme::lerp_color(slate_border, beat_color, beat_flash);
-
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
-    let main = chunks[0];
-    let status_area = chunks[1];
     let lyrics_mode = mode == Mode::Lyrics;
 
-    // The garden is full-bleed paper like upstream's canvas: no dark frame,
-    // and the status row is restyled in quiet paper tones.
+    // Layout: the visualization owns the field. Bar modes get a quiet
+    // one-row header on the theme's canvas; the garden is full-bleed paper
+    // like upstream's canvas. Both end in a single status row.
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+    let (main, status_area) = (chunks[0], chunks[1]);
     let status = if lyrics_mode {
         status_line_with(app, audio, &StatusPalette::paper(), status_area.width)
     } else {
-        status_line(app, audio, accent, status_area.width)
+        let canvas = visualizers::canvas(&app.themes[theme_idx]);
+        status_line_with(
+            app,
+            audio,
+            &StatusPalette::canvas(accent, &app.themes[theme_idx], canvas),
+            status_area.width,
+        )
     };
 
-    let mut title_right = vec![
-        Span::raw(" "),
-        Span::styled(mode.name(), Style::new().fg(chrome)),
-        Span::raw(" "),
-    ];
-    if beat_flash > 0.5 {
-        title_right.push(Span::styled("\u{266A}", Style::new().fg(beat_color)));
-    }
-
-    let mut title_left = vec![Span::styled(" SPECTRUM ", Style::new().fg(chrome))];
-    if audio.demo {
-        title_left.push(Span::styled(
-            " DEMO ",
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    let title_width = 4 + mode.name().chars().count() + if audio.demo { 6 } else { 0 };
     let inner = if lyrics_mode {
         main
     } else {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(border))
-            .title(Line::from(title_left))
-            .title(if area.width as usize > title_width + 12 {
-                Line::from(title_right).right_aligned()
-            } else {
-                Line::from("")
-            });
-        let inner = block.inner(main);
-        f.render_widget(block, main);
-        inner
+        let theme = &app.themes[theme_idx];
+        let canvas = visualizers::canvas(theme);
+        visualizers::paint_canvas(f.buffer_mut(), area, theme);
+        let header = Rect::new(main.x, main.y, main.width, 1);
+        draw_header(
+            f.buffer_mut(),
+            header,
+            mode,
+            audio.demo,
+            beat_flash,
+            theme,
+            canvas,
+        );
+        Rect::new(
+            main.x,
+            main.y + 1,
+            main.width,
+            main.height.saturating_sub(1),
+        )
     };
 
     let App {
@@ -508,46 +515,31 @@ fn draw(
         peaks,
         gram,
         scratch,
+        display,
+        flux,
         ..
     } = app;
     let theme = &themes[theme_idx];
+    let bars: &[f32] = if display.is_empty() {
+        &analysis.bars
+    } else {
+        display
+    };
 
     match mode {
-        Mode::Bars => visualizers::render_spectrum(
+        Mode::Bars => {
+            visualizers::render_spectrum(f.buffer_mut(), inner, bars, theme, peaks, scratch, dt)
+        }
+        Mode::Radial => visualizers::render_radial(
             f.buffer_mut(),
             inner,
-            &analysis.bars,
+            bars,
+            &analysis.waveform,
+            *flux,
             theme,
-            peaks,
             scratch,
-            dt,
         ),
-        Mode::Combo => {
-            // Integrated composition: mirrored halftone bars fill the
-            // field symmetrically (no dead upper half) and the waveform
-            // rides the mirror's centerline, so the trace and the bars
-            // share a single visual axis instead of floating apart.
-            visualizers::render_mirror(f.buffer_mut(), inner, &analysis.bars, theme, scratch);
-            let half = inner.height / 2;
-            let wave_h = (inner.height / 3).clamp(2, inner.height);
-            // Center the band on the mirror's centerline; bounded so the
-            // rect always stays inside `inner`.
-            let wave_top = half
-                .saturating_sub(wave_h / 2)
-                .min(inner.height.saturating_sub(wave_h));
-            let wave = Rect::new(inner.x, inner.y + wave_top, inner.width, wave_h);
-            visualizers::render_oscilloscope(
-                f.buffer_mut(),
-                wave,
-                &analysis.waveform,
-                theme,
-                1.1,
-                scratch,
-            );
-        }
-        Mode::Mirror => {
-            visualizers::render_mirror(f.buffer_mut(), inner, &analysis.bars, theme, scratch)
-        }
+        Mode::Mirror => visualizers::render_mirror(f.buffer_mut(), inner, bars, theme, scratch),
         Mode::Scope => visualizers::render_oscilloscope(
             f.buffer_mut(),
             inner,
@@ -555,41 +547,39 @@ fn draw(
             theme,
             0.9,
             scratch,
+            dt,
         ),
         Mode::Gram => visualizers::render_spectrogram(f.buffer_mut(), inner, gram, theme),
-        Mode::Lyrics => {
-            render_lyrics(f.buffer_mut(), inner, app, analysis, media, lyrics, dt);
-            if audio.demo && inner.width >= 20 {
-                // Honest synthetic-source label, top-left on the paper.
-                let buf = f.buffer_mut();
-                let tag = "DEMO";
-                for (i, ch) in tag.chars().enumerate() {
-                    if let Some(c) = buf.cell_mut((inner.x + 1 + i as u16, inner.y)) {
-                        c.set_char(ch);
-                        c.set_fg(Color::Rgb(176, 58, 32));
-                        c.set_style(Style::new().add_modifier(Modifier::BOLD));
-                    }
-                }
-            }
-        }
+        Mode::Lyrics => render_lyrics(
+            f.buffer_mut(),
+            inner,
+            app,
+            analysis,
+            media,
+            lyrics,
+            dt,
+            audio.demo,
+        ),
     }
 
-    if lyrics_mode {
-        let paper = Color::Rgb(243, 238, 228);
+    let status_bg = if lyrics_mode {
+        Color::Rgb(243, 238, 228)
+    } else {
+        visualizers::canvas(&app.themes[theme_idx])
+    };
+    {
         let buf = f.buffer_mut();
         for x in status_area.x..status_area.x + status_area.width {
             if let Some(c) = buf.cell_mut((x, status_area.y)) {
                 c.set_char(' ');
-                c.set_bg(paper);
+                c.set_bg(status_bg);
             }
         }
-        f.render_widget(
-            Paragraph::new(status).style(Style::new().bg(paper)),
-            status_area,
-        );
-    } else {
-        f.render_widget(Paragraph::new(status), status_area);
     }
+    f.render_widget(
+        Paragraph::new(status).style(Style::new().bg(status_bg)),
+        status_area,
+    );
 
     if help {
         let help_area = centered_rect(46, 15, area);
@@ -614,6 +604,56 @@ fn draw(
 /// EVERYTHING fits; otherwise the short "h help \u{b7} q quit" tier takes
 /// precedence over the description and the tuning readouts, so help and
 /// quit stay discoverable at every width.
+/// The quiet header for the bar modes: wordmark, mode, an honest DEMO
+/// tag when the source is synthetic, and a beat dot that glows and fades
+/// with the (time-based) beat flash.
+fn draw_header(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    mode: Mode,
+    demo: bool,
+    beat_flash: f32,
+    theme: &Theme,
+    canvas: Color,
+) {
+    if area.width < 8 || area.height == 0 {
+        return;
+    }
+    let dim = theme::lerp_color(canvas, Color::Rgb(150, 154, 168), 0.75);
+    let faint = theme::lerp_color(canvas, Color::Rgb(150, 154, 168), 0.45);
+    let mut x = area.x + 1;
+    let end = area.x + area.width;
+    let mut put = |s: &str, fg: Color, bold: bool, x: &mut u16| {
+        for ch in s.chars() {
+            if *x >= end {
+                return;
+            }
+            if let Some(c) = buf.cell_mut((*x, area.y)) {
+                c.set_char(ch).set_fg(fg).set_bg(canvas);
+                if bold {
+                    c.set_style(Style::new().add_modifier(Modifier::BOLD));
+                }
+            }
+            *x += 1;
+        }
+    };
+    put("SPECTRUM", dim, true, &mut x);
+    put("  ", faint, false, &mut x);
+    put(mode.name(), faint, false, &mut x);
+    if demo {
+        put("  ", faint, false, &mut x);
+        put("DEMO", Color::Rgb(214, 170, 60), true, &mut x);
+    }
+    // Beat dot at the right edge.
+    if area.width >= 24 {
+        let bx = end - 2;
+        let glow = theme::lerp_color(faint, theme.beat(), beat_flash.clamp(0.0, 1.0));
+        if let Some(c) = buf.cell_mut((bx, area.y)) {
+            c.set_char('\u{25CF}').set_fg(glow).set_bg(canvas);
+        }
+    }
+}
+
 /// Colours for the status row (dark chrome, or the garden's paper).
 pub struct StatusPalette {
     pub accent: Color,
@@ -623,12 +663,23 @@ pub struct StatusPalette {
 }
 
 impl StatusPalette {
+    #[cfg(test)]
     fn dark(accent: Color) -> Self {
         Self {
             accent,
             dim: Color::Rgb(130, 130, 130),
             text: Color::White,
             warn: Color::Yellow,
+        }
+    }
+
+    /// Quiet tones on the theme canvas.
+    fn canvas(accent: Color, _theme: &Theme, canvas: Color) -> Self {
+        Self {
+            accent,
+            dim: theme::lerp_color(canvas, Color::Rgb(150, 154, 168), 0.6),
+            text: theme::lerp_color(canvas, Color::Rgb(205, 208, 218), 0.9),
+            warn: Color::Rgb(226, 178, 60),
         }
     }
 
@@ -642,6 +693,7 @@ impl StatusPalette {
     }
 }
 
+#[cfg(test)]
 fn status_line(app: &App, audio: &AudioHandle, accent: Color, width: u16) -> Line<'static> {
     status_line_with(app, audio, &StatusPalette::dark(accent), width)
 }
@@ -798,7 +850,7 @@ fn help_text(accent: Color) -> Vec<Line<'static>> {
     lines.extend([
         mk(
             "1 / 2 / 3 / 4 / 5 / 6",
-            "spectrum \u{b7} scope \u{b7} spectrogram \u{b7} combo \u{b7} mirror (default) \u{b7} lyrics garden",
+            "spectrum \u{b7} scope \u{b7} waterfall \u{b7} radial \u{b7} mirror (default) \u{b7} lyrics garden",
         ),
         mk("Tab / Shift+Tab", "cycle visualizations"),
         mk("Space", "pause / resume audio"),
@@ -824,6 +876,7 @@ fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
 }
 
 /// Never leave the terminal broken after a panic.
+#[allow(clippy::too_many_arguments)]
 fn render_lyrics(
     buf: &mut ratatui::buffer::Buffer,
     area: ratatui::layout::Rect,
@@ -832,6 +885,7 @@ fn render_lyrics(
     media: &crate::media::MediaShared,
     lyrics: &crate::lyrics::LyricsShared,
     dt: f32,
+    demo: bool,
 ) {
     let snap = media.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let state = lyrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -891,6 +945,7 @@ fn render_lyrics(
         energy: app.sway_energy.clamp(0.0, 1.0),
         time_s: snap.position_s as f32,
         since_line_change: since,
+        demo,
     };
     crate::garden::render_garden(buf, area, &view);
 }
@@ -946,7 +1001,9 @@ mod tests {
             let mut app = demo_app();
             let area = ratatui::layout::Rect::new(0, 0, w, h);
             let mut buf = Buffer::empty(area);
-            render_lyrics(&mut buf, area, &mut app, &analysis, &media, &lyrics, 0.016);
+            render_lyrics(
+                &mut buf, area, &mut app, &analysis, &media, &lyrics, 0.016, true,
+            );
             let text: String = buf.content().iter().map(|c| c.symbol()).collect();
             assert!(
                 !text.contains("looking for lyrics"),
@@ -988,52 +1045,6 @@ mod tests {
     /// The gate itself must stay strict: a real track change with no
     /// matching lyrics state still shows Loading, never stale fixture words.
     #[test]
-    #[ignore]
-    fn dump_garden_layout() {
-        let media = crate::media::new_shared();
-        let lyrics = crate::lyrics::new_shared();
-        demo::seed_demo_state(&media, &lyrics, 4.5, true, None);
-        for (w, h) in [(144u16, 42u16), (72, 22)] {
-            let mut app = demo_app();
-            let area = ratatui::layout::Rect::new(0, 0, w, h);
-            let mut buf = Buffer::empty(area);
-            render_lyrics(
-                &mut buf,
-                area,
-                &mut app,
-                &FrameAnalysis::quiet(64),
-                &media,
-                &lyrics,
-                0.016,
-            );
-            for y in 0..h {
-                let mut row = String::new();
-                for x in 0..w {
-                    let c = &buf[(x, y)];
-                    let s = c.symbol();
-                    row.push(if s == " " {
-                        ' '
-                    } else {
-                        match c.fg {
-                            Color::Rgb(r, g, b)
-                                if b as i32 > r as i32 + 40 && b as i32 > g as i32 + 20 =>
-                            {
-                                'b'
-                            }
-                            Color::Rgb(r, _g, b) if r as i32 > 170 && r as i32 > b as i32 + 40 => {
-                                'p'
-                            }
-                            _ => '#',
-                        }
-                    });
-                }
-                println!("{}", row.trim_end());
-            }
-            println!("=====");
-        }
-    }
-
-    #[test]
     fn identity_gate_still_blocks_mismatched_state() {
         let media = crate::media::new_shared();
         let lyrics = crate::lyrics::new_shared();
@@ -1053,6 +1064,7 @@ mod tests {
             &media,
             &lyrics,
             0.016,
+            true,
         );
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("looking for lyrics"), "gate relaxed");
@@ -1136,7 +1148,7 @@ mod tests {
         let area = Rect::new(0, 0, 144, 40);
 
         let mut scratch = RenderScratch::default();
-        let mut peaks = Vec::new();
+        let mut peaks = visualizers::Peaks::new();
         let mut bars_buf = Buffer::empty(area);
         visualizers::render_spectrum(
             &mut bars_buf,
@@ -1147,7 +1159,7 @@ mod tests {
             &mut scratch,
             1.0 / 60.0,
         );
-        let bars_filled = nonblank(&bars_buf);
+        let bars_filled = bar_cells(&bars_buf);
         assert!(bars_filled > 300, "bars mode too sparse: {bars_filled}");
 
         // Oscilloscope has a waveform during the loud phase.
@@ -1159,8 +1171,25 @@ mod tests {
             &theme,
             1.1,
             &mut scratch,
+            1.0 / 60.0,
         );
-        assert!(nonblank(&scope_buf) > 20, "scope too sparse");
+        assert!(braille_cells(&scope_buf) > 40, "scope too sparse");
+
+        // Radial: petals and ring.
+        let mut radial_buf = Buffer::empty(area);
+        visualizers::render_radial(
+            &mut radial_buf,
+            area,
+            &frame.bars,
+            &frame.waveform,
+            frame.flux,
+            &theme,
+            &mut scratch,
+        );
+        assert!(
+            braille_cells(&radial_buf) + quadrant_cells(&radial_buf) > 150,
+            "radial too sparse"
+        );
 
         // Mirror renders around the center line.
         let mut mirror_buf = Buffer::empty(area);
@@ -1175,14 +1204,20 @@ mod tests {
         }
         let mut gram_buf = Buffer::empty(area);
         visualizers::render_spectrogram(&mut gram_buf, area, &cols, &theme);
-        assert!(nonblank_bg(&gram_buf) > 200, "spectrogram too sparse");
+        let canvas = visualizers::canvas(&theme);
+        let lit = gram_buf
+            .content()
+            .iter()
+            .filter(|c| c.fg != canvas || c.bg != canvas)
+            .count();
+        assert!(lit > 200, "spectrogram too sparse: {lit}");
     }
 
     #[test]
     fn demo_silence_and_fade_render_quietly() {
         let theme = theme::find_with_depth("spectrum", ColorDepth::True).unwrap();
         let mut scratch = RenderScratch::default();
-        let mut peaks = Vec::new();
+        let mut peaks = visualizers::Peaks::new();
         let area = Rect::new(0, 0, 80, 24);
 
         // Silence: an intentionally near-empty field (dynamics preserved,
@@ -1199,7 +1234,7 @@ mod tests {
             &mut scratch,
             1.0 / 60.0,
         );
-        assert!(nonblank(&buf) <= 2, "silence should render almost empty");
+        assert!(bar_cells(&buf) <= 2, "silence should render almost empty");
 
         // Fade: clearly less filled than the loud drop.
         let fade = demo::synthetic_frame(6.8, 64);
@@ -1225,10 +1260,10 @@ mod tests {
             1.0 / 60.0,
         );
         assert!(
-            nonblank(&fade_buf) < nonblank(&loud_buf),
+            bar_cells(&fade_buf) < bar_cells(&loud_buf),
             "fade ({}) should be quieter than loud ({})",
-            nonblank(&fade_buf),
-            nonblank(&loud_buf)
+            bar_cells(&fade_buf),
+            bar_cells(&loud_buf)
         );
     }
 
@@ -1242,7 +1277,7 @@ mod tests {
 
         let render = |theme: &crate::theme::Theme| -> usize {
             let mut scratch = RenderScratch::default();
-            let mut peaks = Vec::new();
+            let mut peaks = visualizers::Peaks::new();
             let mut buf = Buffer::empty(area);
             visualizers::render_spectrum(
                 &mut buf,
@@ -1274,55 +1309,46 @@ mod tests {
     }
 
     #[test]
-    fn combo_wave_rides_the_mirror_centerline() {
-        // The combo composition: mirrored bars plus a waveform band centered
-        // on the mirror's centerline (integrated axis, no dead upper half).
-        let theme = theme::find_with_depth("spectrum", ColorDepth::True).unwrap();
-        let frame = demo::synthetic_frame(5.0, 64);
-        let area = Rect::new(0, 0, 72, 22);
-        let mut buf = Buffer::empty(area);
-        let mut scratch = RenderScratch::default();
+    fn every_mode_draws_through_the_real_ui_path() {
+        // The headless snapshot runs the real `draw`: every mode must
+        // produce content, the garden must not be stuck in Loading, and
+        // the bar modes must carry the quiet header with an honest DEMO.
+        for mode in 1..=6u8 {
+            let buf = snapshot(&Snapshot {
+                mode,
+                theme: "spectrum",
+                depth: ColorDepth::True,
+                at: 4.5,
+                frozen: false,
+                warmup: 1.0,
+                lyric: None,
+                width: 100,
+                height: 30,
+            });
+            let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+            assert!(!text.contains("looking for lyrics"), "mode {mode} loading");
+            assert!(text.contains("DEMO"), "mode {mode} lost the DEMO label");
+            let drawn = buf.content().iter().filter(|c| c.symbol() != " ").count();
+            assert!(drawn > 60, "mode {mode} drew only {drawn} cells");
+        }
+    }
 
-        // Mirror half of the field: the wave band center must match it.
-        crate::visualizers::render_mirror(&mut buf, area, &frame.bars, &theme, &mut scratch);
-        let half = area.height / 2;
-
-        let wave_h = (area.height / 3).clamp(2, area.height);
-        let wave_top = half
-            .saturating_sub(wave_h / 2)
-            .min(area.height.saturating_sub(wave_h));
-        let wave = Rect::new(area.x, area.y + wave_top, area.width, wave_h);
-        crate::visualizers::render_oscilloscope(
-            &mut buf,
-            wave,
-            &frame.waveform,
-            &theme,
-            1.1,
-            &mut scratch,
-        );
-        // The band straddles the centerline.
-        assert!(
-            wave_top <= half && wave_top + wave_h >= half,
-            "wave band must straddle the centerline (top {wave_top}, h {wave_h}, half {half})"
-        );
-        // Braille trace present inside the band.
-        let braille = (wave.x..wave.x + wave.width)
-            .flat_map(|x| (wave.y..wave.y + wave.height).map(move |y| (x, y)))
-            .filter(|(x, y)| {
-                buf[(*x, *y)]
-                    .symbol()
-                    .chars()
-                    .next()
-                    .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
-            })
-            .count();
-        assert!(braille > 0, "combo must render the waveform");
-        // No peak-cap markers floating in the composition.
-        let caps = (0..area.width)
-            .flat_map(|x| (0..area.height).map(move |y| (x, y)))
-            .filter(|(x, y)| buf[(*x, *y)].symbol() == "\u{2594}")
-            .count();
-        assert_eq!(caps, 0, "combo must not carry detached peak caps");
+    #[test]
+    fn snapshot_is_deterministic_when_frozen() {
+        let s = Snapshot {
+            mode: 5,
+            theme: "spectrum",
+            depth: ColorDepth::True,
+            at: 4.5,
+            frozen: true,
+            warmup: 0.5,
+            lyric: None,
+            width: 72,
+            height: 22,
+        };
+        let a = snapshot(&s);
+        let b = snapshot(&s);
+        assert_eq!(a.content(), b.content());
     }
 
     #[test]
@@ -1342,7 +1368,7 @@ mod tests {
         for (w, h) in sizes {
             let area = Rect::new(0, 0, w, h);
             let mut scratch = RenderScratch::default();
-            let mut peaks = Vec::new();
+            let mut peaks = visualizers::Peaks::new();
 
             // Mirror (default), bars, scope.
             let mut buf = Buffer::empty(area);
@@ -1367,8 +1393,23 @@ mod tests {
                 &theme,
                 1.0,
                 &mut scratch,
+                1.0 / 60.0,
             );
-            assert!(nonblank(&buf) > 0, "scope {w}x{h} empty at loud");
+            assert!(braille_cells(&buf) > 0, "scope {w}x{h} empty at loud");
+            let mut buf = Buffer::empty(area);
+            visualizers::render_radial(
+                &mut buf,
+                area,
+                &loud.bars,
+                &loud.waveform,
+                loud.flux,
+                &theme,
+                &mut scratch,
+            );
+            assert!(
+                braille_cells(&buf) + quadrant_cells(&buf) > 0,
+                "radial {w}x{h} empty at loud"
+            );
 
             // Silence is intentionally quiet everywhere.
             let mut buf = Buffer::empty(area);
@@ -1386,9 +1427,42 @@ mod tests {
             .count()
     }
 
-    fn nonblank_bg(buf: &Buffer) -> usize {
-        (0..buf.area.width * buf.area.height)
-            .filter(|i| buf.content[*i as usize].bg != ratatui::style::Color::Reset)
+    /// Cells carrying a bar glyph (partial or full block).
+    fn bar_cells(buf: &Buffer) -> usize {
+        buf.content()
+            .iter()
+            .filter(|c| {
+                c.symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ('\u{2581}'..='\u{2588}').contains(&ch))
+            })
+            .count()
+    }
+
+    /// Cells carrying a quadrant/half block (silhouettes, petals).
+    fn quadrant_cells(buf: &Buffer) -> usize {
+        buf.content()
+            .iter()
+            .filter(|c| {
+                c.symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ('\u{2580}'..='\u{259F}').contains(&ch))
+            })
+            .count()
+    }
+
+    /// Cells carrying a lit braille glyph.
+    fn braille_cells(buf: &Buffer) -> usize {
+        buf.content()
+            .iter()
+            .filter(|c| {
+                c.symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch))
+            })
             .count()
     }
 

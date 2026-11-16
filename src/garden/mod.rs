@@ -38,6 +38,8 @@ pub struct GardenView<'a> {
     pub time_s: f32,
     /// Seconds since the current line started (regrows the garden).
     pub since_line_change: f32,
+    /// Synthetic demo source: shown as an honest DEMO tag in the header.
+    pub demo: bool,
 }
 
 pub enum GardenState {
@@ -67,6 +69,10 @@ fn paper_color() -> ratatui::style::Color {
 
 /// Minimum em height (terminal rows) for upstream's glyph-texture type.
 pub const TEXTURE_MIN_EM_ROWS: f32 = 12.0;
+/// Below this em height (rows) even silhouettes stop forming letters
+/// (x-height under ~2 rows): the line is shown as plain wrapped text.
+pub const PLAIN_BELOW_EM_ROWS: f32 = 3.4;
+const DEMO_TAG: (u8, u8, u8) = (176, 58, 32);
 
 /// Render the garden into `area` of the terminal buffer.
 pub fn render_garden(buf: &mut Buffer, area: Rect, view: &GardenView<'_>) {
@@ -83,13 +89,24 @@ pub fn render_garden(buf: &mut Buffer, area: Rect, view: &GardenView<'_>) {
         }
     }
 
-    // Title line at the very top, understated.
+    // Header: an honest DEMO tag at the left (when synthetic) and the
+    // title centred in the remaining width, so the two never collide.
     let title = if view.artist.is_empty() {
         view.title.to_string()
     } else {
         format!("{} \u{b7} {}", view.title, view.artist)
     };
-    put_text(buf, area, area.y, &title, rgb(INK_DIM));
+    let mut header = Rect::new(area.x, area.y, area.width, 1);
+    if view.demo && area.width >= 16 {
+        for (i, ch) in "DEMO".chars().enumerate() {
+            if let Some(c) = buf.cell_mut((area.x + 1 + i as u16, area.y)) {
+                c.set_char(ch).set_fg(rgb(DEMO_TAG));
+                c.modifier.insert(ratatui::style::Modifier::BOLD);
+            }
+        }
+        header = Rect::new(area.x + 6, area.y, area.width.saturating_sub(12), 1);
+    }
+    put_text(buf, header, area.y, &title, rgb(INK_DIM));
 
     // The main band: everything between the title and the bottom line.
     let band_top = area.y + 1;
@@ -187,13 +204,20 @@ fn render_garden_line(buf: &mut Buffer, area: Rect, text: &str, view: &GardenVie
     }
     if !font::glyph_supported(trimmed) {
         // Honest fallback: legible normal text (original case preserved),
-        // display-width aware so CJK and friends center correctly.
-        put_text(buf, area, area.y + area.height / 2, trimmed, rgb(INK));
+        // wrapped (never truncated) and display-width aware so CJK and
+        // friends centre correctly.
+        put_wrapped(buf, area, trimmed, rgb(INK));
         return;
     }
 
     let w_design = area.width as f32;
     let data = cached_scene(trimmed, area.width, area.height);
+    if data.s / 2.0 < PLAIN_BELOW_EM_ROWS {
+        // Too small for any legible letterform in this many cells: show
+        // the full line as clean, wrapped text rather than noise.
+        put_wrapped(buf, area, trimmed, rgb(INK));
+        return;
+    }
     // Growth age: the line's timeline drives everything, so a frozen
     // position is fully deterministic. Letters bloom staggered like the
     // reference's regrow.
@@ -374,6 +398,55 @@ fn put_text(buf: &mut Buffer, area: Rect, row: u16, text: &str, color: ratatui::
     }
 }
 
+/// The whole `text` wrapped to `area`'s width at spaces (overlong words
+/// and space-less scripts break at characters), every row centred, the
+/// block centred vertically. Never drops a character that fits the area.
+fn put_wrapped(buf: &mut Buffer, area: Rect, text: &str, color: ratatui::style::Color) {
+    let max = area.width.saturating_sub(2).max(1) as usize;
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let ww = word.width();
+        let sep = usize::from(!cur.is_empty());
+        if cur.width() + sep + ww <= max {
+            if sep == 1 {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+            continue;
+        }
+        if !cur.is_empty() {
+            rows.push(std::mem::take(&mut cur));
+        }
+        // A word wider than a row breaks at characters.
+        for ch in word.chars() {
+            if cur.width() + ch.width().unwrap_or(0) > max {
+                rows.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    let n = rows.len() as u16;
+    let top = area.y + area.height.saturating_sub(n) / 2;
+    for (i, row) in rows.iter().enumerate() {
+        let y = top + i as u16;
+        if y >= area.y + area.height {
+            break;
+        }
+        put_text(buf, area, y, row, color);
+        for x in area.x..area.x + area.width {
+            if let Some(c) = buf.cell_mut((x, y)) {
+                if c.symbol() != " " {
+                    c.modifier.insert(ratatui::style::Modifier::BOLD);
+                }
+            }
+        }
+    }
+}
+
 /// Truncate a string to a display width without splitting a character
 /// half-way (drop chars until they fit).
 fn truncate_to_width(s: &str, max: usize) -> String {
@@ -411,6 +484,7 @@ mod tests {
             energy: 0.3,
             time_s: 4.5,
             since_line_change: 4.5,
+            demo: true,
         }
     }
 
@@ -540,6 +614,7 @@ mod tests {
                     energy: 0.0,
                     time_s: 1.0,
                     since_line_change: 1.0,
+                    demo: false,
                 },
             );
             let text: String = buf
