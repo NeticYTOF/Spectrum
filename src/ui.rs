@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -56,6 +56,11 @@ impl Mode {
     }
 }
 
+/// Beat-flash exponential decay rate (fraction e^-kt remaining after t).
+const BEAT_FLASH_DECAY_PER_SEC: f32 = 8.0;
+/// Spectrogram scroll: one new column this often.
+const GRAM_INTERVAL_SECS: f32 = 1.0 / 30.0;
+
 pub struct App {
     pub mode: Mode,
     pub help: bool,
@@ -67,7 +72,8 @@ pub struct App {
     pub volume: f32,
     peaks: Vec<f32>,
     gram: VecDeque<Vec<f32>>,
-    gram_tick: u32,
+    gram_accum: f32,
+    last_frame: Instant,
     scratch: visualizers::RenderScratch,
     themes: Vec<Theme>,
     theme_idx: usize,
@@ -93,7 +99,8 @@ impl App {
             volume,
             peaks: Vec::new(),
             gram: VecDeque::with_capacity(520),
-            gram_tick: 0,
+            gram_accum: 0.0,
+            last_frame: Instant::now(),
             scratch: visualizers::RenderScratch::new(),
             themes,
             theme_idx,
@@ -145,6 +152,14 @@ fn event_loop(
             }
         }
 
+        // Elapsed time since the previous frame; all per-frame animation
+        // decays are expressed per second and scaled by this, so a slow
+        // or fast terminal changes speed, not character. Clamped so a
+        // stall can't produce a visible jump.
+        let now = Instant::now();
+        let dt = (now - app.last_frame).as_secs_f32().clamp(0.0, 0.1);
+        app.last_frame = now;
+
         // Pull the freshest analysis; claim pending beats so none are missed.
         let (analysis, beat) = {
             let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -156,22 +171,29 @@ fn event_loop(
         if beat {
             app.beat_flash = 1.0;
         } else {
-            app.beat_flash *= 0.88;
+            // Exponential decay: ~85% gone after a quarter second.
+            app.beat_flash *= (-BEAT_FLASH_DECAY_PER_SEC * dt).exp();
             if app.beat_flash < 0.01 {
                 app.beat_flash = 0.0;
             }
         }
 
-        // Spectrogram history: newest column on the right.
-        app.gram_tick = app.gram_tick.wrapping_add(1);
-        if app.mode == Mode::Gram && app.gram_tick.is_multiple_of(2) {
-            app.gram.push_back(analysis.spectrum.clone());
-            while app.gram.len() > 512 {
-                app.gram.pop_front();
+        // Spectrogram history: newest column on the right, pushed at a
+        // fixed wall-clock cadence regardless of frame rate.
+        if app.mode == Mode::Gram {
+            app.gram_accum += dt;
+            if app.gram_accum >= GRAM_INTERVAL_SECS {
+                app.gram_accum = 0.0;
+                app.gram.push_back(analysis.spectrum.clone());
+                while app.gram.len() > 512 {
+                    app.gram.pop_front();
+                }
             }
+        } else {
+            app.gram_accum = GRAM_INTERVAL_SECS;
         }
 
-        terminal.draw(|f| draw(f, app, &analysis, audio))?;
+        terminal.draw(|f| draw(f, app, &analysis, audio, dt))?;
 
         if app.quit {
             return Ok(());
@@ -251,7 +273,7 @@ fn adjust_fall(app: &mut App, shared: &Arc<Mutex<SharedState>>, delta: f32) {
     shared.lock().unwrap_or_else(|e| e.into_inner()).params.fall = app.fall;
 }
 
-fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHandle) {
+fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHandle, dt: f32) {
     let area = f.area();
     if area.width < 12 || area.height < 5 {
         return; // too small to render anything useful
@@ -311,6 +333,7 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
             theme,
             peaks,
             scratch,
+            dt,
         ),
         Mode::Scope => visualizers::render_oscilloscope(
             f.buffer_mut(),

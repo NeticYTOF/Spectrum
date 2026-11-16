@@ -63,9 +63,13 @@ fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, fg: Color) {
     }
 }
 
+/// Peak-cap fall speed, in fraction of the bar area per second.
+const PEAK_FALL_PER_SEC: f32 = 1.2;
+
 /// Bottom-anchored spectrum bars with partial-block tops and peak caps.
 ///
-/// `peaks` carries per-column peak-hold values across frames.
+/// `peaks` carries per-column peak-hold values across frames; `dt` is the
+/// frame time in seconds so the peak decay is frame-rate independent.
 pub fn render_spectrum(
     buf: &mut Buffer,
     area: Rect,
@@ -73,6 +77,7 @@ pub fn render_spectrum(
     theme: &Theme,
     peaks: &mut Vec<f32>,
     scratch: &mut RenderScratch,
+    dt: f32,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -89,9 +94,9 @@ pub fn render_spectrum(
     for x in 0..w {
         let v = vals[x].clamp(0.0, 1.0);
 
-        // Peak-hold with slow decay.
+        // Peak-hold with time-based decay (frame-rate independent).
         let peak = &mut peaks[x];
-        *peak = (*peak - 0.02).max(v);
+        *peak = (*peak - PEAK_FALL_PER_SEC * dt).max(v);
 
         let filled = v * h as f32;
         let full = filled.floor() as usize;
@@ -245,6 +250,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn peak_decay_is_time_based() {
+        let theme = crate::theme::find("fire").unwrap();
+        let area = Rect::new(0, 0, 2, 10);
+        let bars = vec![1.0, 1.0];
+
+        // Two frames at 60 fps advance peaks by ~2/60 s of fall.
+        let mut peaks = Vec::new();
+        let mut scratch = RenderScratch::new();
+        let mut buf = Buffer::empty(area);
+        render_spectrum(&mut buf, area, &bars, &theme, &mut peaks, &mut scratch, DT);
+        // Bar still at 1.0 keeps the peak pinned at the top.
+        assert_eq!(peaks[0], 1.0);
+
+        // Bar drops to zero; decay must depend on elapsed time, not the
+        // number of calls: one long frame equals many short ones.
+        let zero = vec![0.0, 0.0];
+        let mut p_short = peaks.clone();
+        for _ in 0..6 {
+            render_spectrum(
+                &mut Buffer::empty(area),
+                area,
+                &zero,
+                &theme,
+                &mut p_short,
+                &mut scratch,
+                DT,
+            );
+        }
+        let mut p_long = peaks.clone();
+        render_spectrum(
+            &mut Buffer::empty(area),
+            area,
+            &zero,
+            &theme,
+            &mut p_long,
+            &mut scratch,
+            6.0 * DT,
+        );
+        assert!(
+            (p_short[0] - p_long[0]).abs() < 1e-3,
+            "decay must track wall-clock time"
+        );
+        assert!(p_long[0] < 0.9, "peaks must visibly fall");
+    }
+
+    #[test]
     fn braille_bit_table() {
         // Unicode braille bits: dots 1-8 map to 0x01,0x02,0x04,0x40 (left
         // column) and 0x08,0x10,0x20,0x80 (right column).
@@ -319,6 +370,7 @@ mod tests {
             &theme,
             &mut Vec::new(),
             &mut scratch,
+            DT,
         );
         render_spectrum(
             &mut buf,
@@ -327,6 +379,7 @@ mod tests {
             &theme,
             &mut Vec::new(),
             &mut scratch,
+            DT,
         );
         render_oscilloscope(
             &mut buf,
@@ -348,6 +401,9 @@ mod tests {
         render_spectrogram(&mut buf, Rect::new(0, 0, 4, 3), &cols, &theme);
     }
 
+    /// Nominal 60 fps frame time used by renderer tests.
+    const DT: f32 = 1.0 / 60.0;
+
     #[test]
     fn spectrum_draws_in_bounds_only() {
         let theme = crate::theme::find("ice").unwrap();
@@ -356,7 +412,7 @@ mod tests {
         let bars = vec![1.0; 5];
         let mut peaks = Vec::new();
         let mut scratch = RenderScratch::new();
-        render_spectrum(&mut buf, area, &bars, &theme, &mut peaks, &mut scratch);
+        render_spectrum(&mut buf, area, &bars, &theme, &mut peaks, &mut scratch, DT);
         // Full-height bars fill the bottom row entirely.
         let filled = (0..5)
             .filter(|&x| buf[(x as u16, 3)].symbol() == "\u{2588}")

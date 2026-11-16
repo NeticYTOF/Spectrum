@@ -28,6 +28,20 @@ const BEAT_MIN_FRAMES: usize = 20;
 const BEAT_REFRACTORY: Duration = Duration::from_millis(140);
 const DB_FLOOR: f32 = 96.0;
 const FLUX_HISTORY: usize = 64;
+/// Nominal tick rate: per-tick smoothing fractions are converted to
+/// per-second rates as if evaluated at this frequency.
+const TICKS_PER_SEC: f32 = 60.0;
+
+/// Convert a per-tick smoothing fraction into the time-based factor for
+/// a given dt: `1 - e^(-rate*dt)`. Matches the old behavior exactly at
+/// the nominal tick rate and stays correct when ticks drift.
+fn rate_from_fraction(fraction: f32) -> f32 {
+    -(1.0 - fraction.clamp(0.0, 0.999)).ln() * TICKS_PER_SEC
+}
+
+fn smoothing_factor(rate: f32, dt: f32) -> f32 {
+    1.0 - (-rate * dt).exp()
+}
 
 /// Tunables shared between the UI and the analyzer thread.
 #[derive(Clone, Copy)]
@@ -164,12 +178,15 @@ impl Analyzer {
     ///
     /// `active` is false when no new samples arrived since the last tick
     /// (playback paused or finished): the bars then decay to silence
-    /// instead of freezing or showing stale data.
-    pub fn tick(&mut self, params: &Params, active: bool) -> FrameAnalysis {
+    /// instead of freezing or showing stale data. `dt` is the time since
+    /// the previous tick in seconds, so smoothing is wall-clock based.
+    pub fn tick(&mut self, params: &Params, active: bool, dt: f32) -> FrameAnalysis {
         let params = params.clamped();
+        let dt = dt.clamp(0.001, 0.25);
 
         if !active || self.history.len() < FFT_SIZE {
-            let decay = 1.0 - params.fall;
+            // Time-based decay toward silence.
+            let decay = (-rate_from_fraction(params.fall) * dt).exp();
             for b in &mut self.bars {
                 *b *= decay;
             }
@@ -212,17 +229,20 @@ impl Analyzer {
             }
             self.targets[i] = norm(best, params.sensitivity);
         }
+        let bars_fall = smoothing_factor(rate_from_fraction(params.fall), dt);
+        let bars_rise = smoothing_factor(rate_from_fraction(BARS_RISE), dt);
+        let spectrum_rise = smoothing_factor(rate_from_fraction(SPECTRUM_RISE), dt);
         for i in 0..self.bands {
             let target = self.targets[i];
             let cur = self.bars[i];
             // Asymmetric smoothing: bars jump up fast, fall gracefully.
             self.bars[i] = if target >= cur {
-                cur + (target - cur) * BARS_RISE
+                cur + (target - cur) * bars_rise
             } else {
-                cur + (target - cur) * params.fall
+                cur + (target - cur) * bars_fall
             };
             let s = &mut self.spectrum[i];
-            *s += (target - *s) * SPECTRUM_RISE;
+            *s += (target - *s) * spectrum_rise;
         }
 
         // After inactivity the flux baseline is stale: diffing against the
@@ -336,8 +356,12 @@ pub fn spawn_analyzer(
         .name("spectrum-analyzer".into())
         .spawn(move || {
             let mut analyzer = Analyzer::new(sample_rate, bands);
+            let mut last = Instant::now();
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(15));
+                let now = Instant::now();
+                let dt = (now - last).as_secs_f32();
+                last = now;
                 let mut active = false;
                 {
                     let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -347,7 +371,7 @@ pub fn spawn_analyzer(
                     }
                 }
                 let params = shared.lock().unwrap_or_else(|e| e.into_inner()).params;
-                let frame = analyzer.tick(&params, active);
+                let frame = analyzer.tick(&params, active, dt);
                 let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
                 if frame.beat {
                     sh.beats_pending = sh.beats_pending.saturating_add(1);
@@ -361,6 +385,10 @@ pub fn spawn_analyzer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nominal 60 Hz tick time: reproduces the pre-existing smoothing
+    /// behavior exactly while exercising the time-based code path.
+    const DT: f32 = 1.0 / 60.0;
 
     fn feed_sine(an: &mut Analyzer, rate: f32, freq: f32, samples: usize) {
         for i in 0..samples {
@@ -377,7 +405,7 @@ mod tests {
         };
         let mut an = Analyzer::new(44_100, 64);
         feed_sine(&mut an, 44_100.0, 440.0, FFT_SIZE * 2);
-        let frame = an.tick(&params, true);
+        let frame = an.tick(&params, true, DT);
 
         let peak = frame
             .bars
@@ -407,15 +435,15 @@ mod tests {
         };
         let mut an = Analyzer::new(44_100, 64);
         feed_sine(&mut an, 44_100.0, 440.0, FFT_SIZE * 2);
-        let first = an.tick(&params, true);
+        let first = an.tick(&params, true, DT);
         assert!(first.bars.iter().any(|&b| b > 0.3));
 
         for _ in 0..40 {
-            let f = an.tick(&params, false);
+            let f = an.tick(&params, false, DT);
             assert!(f.waveform.is_empty());
             assert!(!f.beat);
         }
-        let last = an.tick(&params, false);
+        let last = an.tick(&params, false, DT);
         assert!(last.bars.iter().all(|&b| b < 0.01));
     }
 
@@ -427,7 +455,7 @@ mod tests {
         };
         let mut an = Analyzer::new(44_100, 64);
         an.push_sample(0.5);
-        let f = an.tick(&params, true);
+        let f = an.tick(&params, true, DT);
         assert!(f.bars.iter().all(|&b| b == 0.0));
         assert!(!f.beat);
     }
@@ -442,7 +470,7 @@ mod tests {
         };
         let mut an = Analyzer::new(44_100, 64);
         feed_sine(&mut an, 44_100.0, 440.0, 4096);
-        let frame = an.tick(&params, true);
+        let frame = an.tick(&params, true, DT);
         assert_eq!(frame.waveform.len(), WAVE_DISPLAY);
         assert!(frame.waveform[0] <= 0.0, "must trigger on a crossing");
         assert!(frame.waveform[1] > 0.0, "must be a rising crossing");
@@ -463,7 +491,7 @@ mod tests {
                     let t = i as f32 / 44_100.0;
                     an.push_sample((2.0 * PI * freq * t + phase).sin() * 0.9);
                 }
-                let frame = an.tick(&params, true);
+                let frame = an.tick(&params, true, DT);
                 assert_eq!(
                     frame.waveform.len(),
                     WAVE_DISPLAY,
@@ -484,7 +512,7 @@ mod tests {
                     let t = i as f32 / 44_100.0;
                     an.push_sample((2.0 * PI * freq * t + phase).sin() * 0.9);
                 }
-                let frame = an.tick(&params, true);
+                let frame = an.tick(&params, true, DT);
                 assert_eq!(
                     frame.waveform.len(),
                     WAVE_DISPLAY,
@@ -504,7 +532,7 @@ mod tests {
             sensitivity: 1.0,
             fall: 0.2,
         };
-        let frame = an.tick(&params, true);
+        let frame = an.tick(&params, true, DT);
         assert!(frame.waveform.len() <= 2, "history shorter than window");
 
         // Constant positive signal (DC): no crossing, still a full window.
@@ -512,7 +540,7 @@ mod tests {
         for _ in 0..(FFT_SIZE * 2) {
             an.push_sample(0.5);
         }
-        let frame = an.tick(&params, true);
+        let frame = an.tick(&params, true, DT);
         assert_eq!(frame.waveform.len(), WAVE_DISPLAY);
     }
 
@@ -525,11 +553,11 @@ mod tests {
         let mut an = Analyzer::new(44_100, 64);
         feed_sine(&mut an, 44_100.0, 440.0, FFT_SIZE * 4);
         for _ in 0..30 {
-            an.tick(&params, true);
+            an.tick(&params, true, DT);
         }
         // Pause: no fresh samples.
         for _ in 0..10 {
-            an.tick(&params, false);
+            an.tick(&params, false, DT);
         }
         // Resume: more samples flow; the first active tick must have zero
         // flux and no phantom beat.
@@ -537,7 +565,7 @@ mod tests {
             let t = (FFT_SIZE * 4 + i) as f32 / 44_100.0;
             an.push_sample((2.0 * PI * 440.0 * t).sin() * 0.9);
         }
-        let frame = an.tick(&params, true);
+        let frame = an.tick(&params, true, DT);
         assert!(!frame.beat, "resume tick must not register a beat");
         assert_eq!(frame.flux, 0.0, "resume flux must be reseeded");
         // Once running normally, flux is non-zero again.
@@ -545,7 +573,7 @@ mod tests {
             let t = (FFT_SIZE * 6 + i) as f32 / 44_100.0;
             an.push_sample((2.0 * PI * 440.0 * t).sin() * 0.9);
         }
-        let frame = an.tick(&params, true);
+        let frame = an.tick(&params, true, DT);
         assert!(frame.flux >= 0.0);
     }
 
