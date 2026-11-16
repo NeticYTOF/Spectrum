@@ -91,6 +91,10 @@ pub struct Analyzer {
     bars: Vec<f32>,
     spectrum: Vec<f32>,
     last_beat: Instant,
+    /// Whether the previous tick saw fresh samples; used to reseed the
+    /// spectral-flux baseline after a pause so resuming can't register
+    /// a phantom beat.
+    was_active: bool,
 }
 
 impl Analyzer {
@@ -142,6 +146,7 @@ impl Analyzer {
             bars: vec![0.0; bands],
             spectrum: vec![0.0; bands],
             last_beat: Instant::now(),
+            was_active: false,
         }
     }
 
@@ -171,6 +176,7 @@ impl Analyzer {
             for s in &mut self.spectrum {
                 *s *= 0.9;
             }
+            self.was_active = active;
             return FrameAnalysis {
                 bars: self.bars.clone(),
                 spectrum: self.spectrum.clone(),
@@ -219,6 +225,13 @@ impl Analyzer {
             *s += (target - *s) * SPECTRUM_RISE;
         }
 
+        // After inactivity the flux baseline is stale: diffing against the
+        // pre-pause window would spike. Reseed it so the resume tick has
+        // zero flux and cannot fire a phantom beat.
+        if !self.was_active {
+            self.prev_mags.copy_from_slice(&self.mags);
+        }
+
         // Spectral flux -> beat detection.
         let mut flux = 0.0f32;
         for k in 0..half {
@@ -243,6 +256,7 @@ impl Analyzer {
             self.flux_hist.pop_front();
         }
         self.prev_mags.copy_from_slice(&self.mags);
+        self.was_active = true;
 
         // Waveform: trigger on the first rising zero crossing where a
         // full display window still fits, then show a fixed-length window
@@ -500,6 +514,39 @@ mod tests {
         }
         let frame = an.tick(&params, true);
         assert_eq!(frame.waveform.len(), WAVE_DISPLAY);
+    }
+
+    #[test]
+    fn resume_after_pause_does_not_fire_phantom_beat() {
+        let params = Params {
+            sensitivity: 1.0,
+            fall: 0.2,
+        };
+        let mut an = Analyzer::new(44_100, 64);
+        feed_sine(&mut an, 44_100.0, 440.0, FFT_SIZE * 4);
+        for _ in 0..30 {
+            an.tick(&params, true);
+        }
+        // Pause: no fresh samples.
+        for _ in 0..10 {
+            an.tick(&params, false);
+        }
+        // Resume: more samples flow; the first active tick must have zero
+        // flux and no phantom beat.
+        for i in 0..(FFT_SIZE * 2) {
+            let t = (FFT_SIZE * 4 + i) as f32 / 44_100.0;
+            an.push_sample((2.0 * PI * 440.0 * t).sin() * 0.9);
+        }
+        let frame = an.tick(&params, true);
+        assert!(!frame.beat, "resume tick must not register a beat");
+        assert_eq!(frame.flux, 0.0, "resume flux must be reseeded");
+        // Once running normally, flux is non-zero again.
+        for i in 0..FFT_SIZE {
+            let t = (FFT_SIZE * 6 + i) as f32 / 44_100.0;
+            an.push_sample((2.0 * PI * 440.0 * t).sin() * 0.9);
+        }
+        let frame = an.tick(&params, true);
+        assert!(frame.flux >= 0.0);
     }
 
     #[test]
