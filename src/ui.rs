@@ -164,7 +164,7 @@ fn event_loop(
 
         // Spectrogram history: newest column on the right.
         app.gram_tick = app.gram_tick.wrapping_add(1);
-        if app.mode == Mode::Gram && app.gram_tick % 2 == 0 {
+        if app.mode == Mode::Gram && app.gram_tick.is_multiple_of(2) {
             app.gram.push_back(analysis.spectrum.clone());
             while app.gram.len() > 512 {
                 app.gram.pop_front();

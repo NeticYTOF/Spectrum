@@ -51,15 +51,9 @@ impl RenderScratch {
 pub fn fill_sample_bars(bars: &[f32], n: usize, out: &mut Vec<f32>) {
     out.clear();
     out.resize(n, 0.0);
-    for i in 0..n {
-        out[i] = sample_at(
-            bars,
-            if n == 1 {
-                0.0
-            } else {
-                i as f32 / (n - 1) as f32
-            },
-        );
+    let step = if n > 1 { 1.0 / (n - 1) as f32 } else { 0.0 };
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = sample_at(bars, i as f32 * step);
     }
 }
 
@@ -303,7 +297,14 @@ mod tests {
             &mut Vec::new(),
             &mut scratch,
         );
-        render_oscilloscope(&mut buf, Rect::new(0, 0, 4, 3), &[], &theme, 1.0, &mut scratch);
+        render_oscilloscope(
+            &mut buf,
+            Rect::new(0, 0, 4, 3),
+            &[],
+            &theme,
+            1.0,
+            &mut scratch,
+        );
         render_oscilloscope(
             &mut buf,
             Rect::new(0, 0, 4, 3),

@@ -37,7 +37,10 @@ impl Theme {
     }
 }
 
-const THEMES: &[(&str, &[(u8, u8, u8)])] = &[
+/// One gradient color stop in RGB.
+type Stop = (u8, u8, u8);
+
+const THEMES: &[(&str, &[Stop])] = &[
     (
         "spectrum",
         &[

@@ -128,7 +128,8 @@ impl<S> TeeSource<S> {
     }
 }
 
-/// Whatever the decoder yields becomes f32 for the analysis tap.
+/// Whatever the decoder or capture device yields becomes f32 for analysis.
+/// Covers every rodio/cpal sample type; Copy types are converted by value.
 trait IntoF32 {
     fn to_f32(self) -> f32;
 }
@@ -258,53 +259,23 @@ pub fn start_file(path: &Path, queue: SampleQueue) -> Result<AudioHandle> {
     })
 }
 
-/// Sample-type conversion so every capture format feeds the same f32 queue.
-trait AsF32 {
-    fn as_f32(self) -> f32;
-}
-
-impl AsF32 for f32 {
-    fn as_f32(self) -> f32 {
-        self
-    }
-}
-impl AsF32 for i8 {
-    fn as_f32(self) -> f32 {
-        self as f32 / 128.0
-    }
-}
-impl AsF32 for i16 {
-    fn as_f32(self) -> f32 {
-        self as f32 / 32_768.0
-    }
-}
-impl AsF32 for i32 {
-    fn as_f32(self) -> f32 {
+impl IntoF32 for i32 {
+    fn to_f32(self) -> f32 {
         self as f32 / 2_147_483_648.0
     }
 }
-impl AsF32 for i64 {
-    fn as_f32(self) -> f32 {
-        self as f32 / 9.223_372e18
-    }
-}
-impl AsF32 for u8 {
-    fn as_f32(self) -> f32 {
-        (self as f32 - 128.0) / 128.0
-    }
-}
-impl AsF32 for u16 {
-    fn as_f32(self) -> f32 {
-        (self as f32 - 32_768.0) / 32_768.0
-    }
-}
-impl AsF32 for u32 {
-    fn as_f32(self) -> f32 {
+impl IntoF32 for u32 {
+    fn to_f32(self) -> f32 {
         (self as f32 - 2_147_483_648.0) / 2_147_483_648.0
     }
 }
-impl AsF32 for u64 {
-    fn as_f32(self) -> f32 {
+impl IntoF32 for i64 {
+    fn to_f32(self) -> f32 {
+        self as f32 / 9.223_372e18
+    }
+}
+impl IntoF32 for u64 {
+    fn to_f32(self) -> f32 {
         (self as f32 - 9.223_372e18) / 9.223_372e18
     }
 }
@@ -316,7 +287,7 @@ fn build_stream<T>(
     channels: u16,
 ) -> Result<cpal::Stream>
 where
-    T: cpal::SizedSample + AsF32,
+    T: cpal::SizedSample + IntoF32,
 {
     let channels = channels.max(1);
     let mut batch: Vec<f32> = Vec::with_capacity(2048);
@@ -329,7 +300,7 @@ where
             // it to the queue in one bulk push (one lock per callback).
             batch.clear();
             for sample in data {
-                let v = (*sample).as_f32();
+                let v = (*sample).to_f32();
                 if channels <= 1 {
                     batch.push(v);
                 } else {
