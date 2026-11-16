@@ -120,16 +120,20 @@ pub fn render_spectrum(
 }
 
 /// Braille dot position -> bit in the Unicode braille pattern.
+///
+/// Dots are numbered 1..8 per the Unicode standard:
+/// 1-4 left column top-to-bottom, 5-8 right column, then bits follow
+/// dot order: dot 7 (bottom-left) is 0x40, dot 8 (bottom-right) is 0x80.
 fn braille_bit(col: usize, row: usize) -> u16 {
     match (col, row) {
-        (0, 0) => 0x01,
-        (0, 1) => 0x02,
-        (0, 2) => 0x04,
-        (0, 3) => 0x80,
-        (1, 0) => 0x08,
-        (1, 1) => 0x10,
-        (1, 2) => 0x20,
-        (1, 3) => 0x40,
+        (0, 0) => 0x01, // dot 1
+        (0, 1) => 0x02, // dot 2
+        (0, 2) => 0x04, // dot 3
+        (0, 3) => 0x40, // dot 7 (bottom-left)
+        (1, 0) => 0x08, // dot 4
+        (1, 1) => 0x10, // dot 5
+        (1, 2) => 0x20, // dot 6
+        (1, 3) => 0x80, // dot 8 (bottom-right)
         _ => 0,
     }
 }
@@ -242,14 +246,41 @@ mod tests {
 
     #[test]
     fn braille_bit_table() {
+        // Unicode braille bits: dots 1-8 map to 0x01,0x02,0x04,0x40 (left
+        // column) and 0x08,0x10,0x20,0x80 (right column).
         assert_eq!(braille_bit(0, 0), 0x01);
         assert_eq!(braille_bit(0, 1), 0x02);
         assert_eq!(braille_bit(0, 2), 0x04);
-        assert_eq!(braille_bit(0, 3), 0x80);
+        assert_eq!(braille_bit(0, 3), 0x40, "dot 7 is bottom-LEFT");
         assert_eq!(braille_bit(1, 0), 0x08);
         assert_eq!(braille_bit(1, 1), 0x10);
         assert_eq!(braille_bit(1, 2), 0x20);
-        assert_eq!(braille_bit(1, 3), 0x40);
+        assert_eq!(braille_bit(1, 3), 0x80, "dot 8 is bottom-RIGHT");
+    }
+
+    /// Regression: rendered braille characters must match the real
+    /// Unicode codepoints for the dot positions involved.
+    #[test]
+    fn oscilloscope_renders_true_unicode_dots() {
+        let theme = crate::theme::find("fire").unwrap();
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buf = Buffer::empty(area);
+        let mut scratch = RenderScratch::new();
+        // 2 sub-columns: left sample dips to -1 (bottom-left dot 7,
+        // U+2840 alone), right sample peaks to +1 (top-right dot 4).
+        let wave = [-1.0, 1.0, 1.0, 1.0];
+        render_oscilloscope(&mut buf, area, &wave, &theme, 1.0, &mut scratch);
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "\u{2848}",
+            "must combine dot 7 (0x40) and dot 4 (0x08), not the swap"
+        );
+
+        // Bottom row only: constant -1 -> both bottom dots 7+8 = U+28C0.
+        let mut buf2 = Buffer::empty(area);
+        let wave = [-1.0, -1.0, -1.0, -1.0];
+        render_oscilloscope(&mut buf2, area, &wave, &theme, 1.0, &mut scratch);
+        assert_eq!(buf2[(0, 0)].symbol(), "\u{28C0}");
     }
 
     #[test]
