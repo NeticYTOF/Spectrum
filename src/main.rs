@@ -46,6 +46,11 @@ struct Args {
     #[arg(long)]
     exit_after: Option<f32>,
 
+    /// With --demo: freeze the synthetic timeline at this cycle time
+    /// (seconds) for deterministic, pixel-identical frames
+    #[arg(long)]
+    freeze_at: Option<f32>,
+
     /// Number of frequency bands (8..=256)
     #[arg(long, default_value_t = DEFAULT_BANDS)]
     bars: usize,
@@ -78,6 +83,14 @@ fn main() -> Result<()> {
     if let Some(secs) = args.exit_after {
         if !secs.is_finite() || secs <= 0.0 {
             bail!("--exit-after must be a positive number of seconds");
+        }
+    }
+    if let Some(t) = args.freeze_at {
+        if !args.demo {
+            bail!("--freeze-at requires --demo (it pins the synthetic timeline)");
+        }
+        if !t.is_finite() || t < 0.0 {
+            bail!("--freeze-at must be a finite number of seconds >= 0");
         }
     }
 
@@ -126,6 +139,7 @@ fn main() -> Result<()> {
             bands,
             stop.clone(),
             handle.demo_pause.clone(),
+            args.freeze_at,
         );
         let r = ui::run(&shared, &handle, theme.name, depth, start_mode, exit_after);
         stop.store(true, Ordering::Relaxed);

@@ -125,12 +125,17 @@ pub fn synthetic_frame(t: f32, bands: usize) -> FrameAnalysis {
 
 /// Publish synthetic frames at ~60 Hz until `stop` is set. Honors the demo
 /// pause flag: time freezes while paused, exactly like real paused audio.
+///
+/// With `freeze_at`, the generator publishes the same deterministic frame
+/// at that exact cycle time forever - pixel-identical output for before/
+/// after comparison without touching any hardware.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_demo(
     shared: Arc<Mutex<SharedState>>,
     bands: usize,
     stop: Arc<AtomicBool>,
     pause: Option<Arc<AtomicBool>>,
+    freeze_at: Option<f32>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("spectrum-demo".into())
@@ -138,19 +143,26 @@ pub fn spawn_demo(
             let mut t = 0.0f32;
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(DEMO_TICK);
-                let paused = pause
-                    .as_ref()
-                    .map(|p| p.load(Ordering::Relaxed))
-                    .unwrap_or(false);
-                if !paused {
-                    t += DEMO_TICK.as_secs_f32();
-                    let frame = synthetic_frame(t, bands);
-                    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-                    if frame.beat {
-                        sh.beats_pending = sh.beats_pending.saturating_add(1);
-                    }
-                    sh.latest = Arc::new(frame);
+                let frozen = freeze_at.is_some();
+                let paused = !frozen
+                    && pause
+                        .as_ref()
+                        .map(|p| p.load(Ordering::Relaxed))
+                        .unwrap_or(false);
+                if paused {
+                    continue;
                 }
+                if !frozen {
+                    t += DEMO_TICK.as_secs_f32();
+                }
+                let t = freeze_at.unwrap_or(t);
+                let frame = synthetic_frame(t, bands);
+                let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                // A frozen frame must not re-fire the beat flash forever.
+                if frame.beat && !frozen {
+                    sh.beats_pending = sh.beats_pending.saturating_add(1);
+                }
+                sh.latest = Arc::new(frame);
             }
         })
         .expect("failed to spawn demo thread")
@@ -159,6 +171,18 @@ pub fn spawn_demo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_frames_are_deterministic() {
+        // The generator is a pure function of cycle time: the same frozen
+        // time yields pixel-identical frames (what --freeze-at relies on).
+        let a = synthetic_frame(4.375, 64);
+        let b = synthetic_frame(4.375, 64);
+        assert_eq!(a.bars, b.bars);
+        assert_eq!(a.spectrum, b.spectrum);
+        assert_eq!(a.waveform.len(), b.waveform.len());
+        assert!(!a.bars.is_empty());
+    }
 
     #[test]
     fn cycle_hits_silence_and_peak() {

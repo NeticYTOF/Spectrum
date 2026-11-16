@@ -18,19 +18,23 @@ type Stop = (u8, u8, u8);
 /// 4x4 Bayer matrix for ordered dithering; thresholds tile the screen.
 const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
-/// Ordered-dither threshold in [0, 1) for a screen position.
-fn bayer_threshold(x: u16, y: u16) -> f32 {
+/// Ordered-dither threshold in [0, 1) for a screen position. Shared by the
+/// color-step dither and the glyph-density halftone so stipple patterns
+/// stay spatially coherent across both.
+pub(crate) fn bayer_threshold(x: u16, y: u16) -> f32 {
     (BAYER4[(y % 4) as usize][(x % 4) as usize] as f32 + 0.5) / 16.0
 }
 
 /// Terminal color depth a theme is rendered for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColorDepth {
-    /// 24-bit RGB (the default; no quantization or dithering).
+    /// 24-bit RGB. Gradient steps are exact colors; the ordered stipple
+    /// between steps still applies (it is the signature look, not a
+    /// quantization workaround).
     True,
-    /// xterm-256: nearest-palette colors plus ordered dithering.
+    /// xterm-256: nearest-palette gradient steps plus the ordered stipple.
     P256,
-    /// 16 ANSI colors: nearest-palette colors plus ordered dithering.
+    /// 16 ANSI colors: nearest-palette gradient steps plus the stipple.
     Ansi16,
 }
 
@@ -200,13 +204,10 @@ const THEMES: &[(&str, &[Stop])] = &[
         "spectrum",
         &[
             (8, 8, 32),
-            (30, 30, 140),
-            (20, 160, 230),
-            (40, 220, 120),
-            (240, 230, 80),
-            (250, 130, 30),
-            (255, 60, 60),
-            (255, 220, 200),
+            (26, 44, 148),
+            (36, 128, 230),
+            (150, 216, 255),
+            (255, 246, 232),
         ],
     ),
     (
@@ -338,6 +339,23 @@ pub fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_theme_is_a_coherent_cool_ramp() {
+        // The default "spectrum" identity is a single cool ramp with a warm
+        // tip - no rainbow bands.
+        let t = find("spectrum").unwrap();
+        assert_eq!(t.at(0.0), Color::Rgb(8, 8, 32), "deep navy floor");
+        assert_eq!(t.at(1.0), Color::Rgb(255, 246, 232), "warm white tip");
+        // Interior steps below the warm tip stay blue-dominant (b >= r).
+        for i in 1..(GRADIENT_STEPS - 1) * 4 / 5 {
+            let rgb = to_rgb(t.gradient[i]);
+            assert!(
+                rgb[2] >= rgb[0],
+                "step {i} must stay cool (blue-dominant): {rgb:?}"
+            );
+        }
+    }
 
     #[test]
     fn gradient_covers_extremes() {

@@ -64,6 +64,39 @@ fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, fg: Color) {
 /// Peak-cap fall speed, in fraction of the bar area per second.
 const PEAK_FALL_PER_SEC: f32 = 1.2;
 
+/// Shade cells from sparse to solid: blank, light, medium, dark, full.
+const SHADES: [char; 5] = [' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2588}'];
+
+/// Sub-cell halftone: map a coverage in 0..=1 to a shade glyph, ordered-
+/// dithered between density levels by the same 4x4 Bayer pattern the
+/// color dithering uses. A pure function of (coverage, x, y): temporally
+/// stable, no per-frame noise, and together with the terminal's own dot
+/// structure inside \u{2591..2593} this yields a fine stipple instead of
+/// full-cell color checks.
+fn shade_glyph(coverage: f32, x: u16, y: u16) -> char {
+    let c = coverage.clamp(0.0, 1.0) * 4.0;
+    let base = c.floor();
+    let frac = c - base;
+    let up = if frac > crate::theme::bayer_threshold(x, y) {
+        1.0
+    } else {
+        0.0
+    };
+    SHADES[((base + up) as usize).min(4)]
+}
+
+/// Halftone color for a bar body cell: the gradient at a floored
+/// intensity, so sparse stipples still read against the background
+/// (never darker than ~30% of the ramp) while loud tops glow.
+fn body_color_t(t: f32) -> f32 {
+    0.3 + 0.7 * t.clamp(0.0, 1.0)
+}
+/// Coverage for a bar body cell: density rises with height, floored so
+/// body cells are never blank.
+fn body_coverage(t: f32) -> f32 {
+    0.35 + 0.65 * t.clamp(0.0, 1.0)
+}
+
 /// Bottom-anchored spectrum bars with partial-block tops and peak caps.
 ///
 /// `peaks` carries per-column peak-hold values across frames; `dt` is the
@@ -104,7 +137,10 @@ pub fn render_spectrum(
             let y = area.y + (h - 1 - j) as u16;
             let t = (j + 1) as f32 / h as f32;
             let x = area.x + x as u16;
-            put(buf, x, y, BLOCKS[7], theme.at_dither(t, x, y));
+            // Halftone body: ordered-dithered shade glyph (fine stipple)
+            // with the gradient color at a floored intensity.
+            let glyph = shade_glyph(body_coverage(t), x, y);
+            put(buf, x, y, glyph, theme.at_dither(body_color_t(t), x, y));
         }
         if full < h && frac > 0.06 {
             let y = area.y + (h - 1 - full) as u16;
@@ -238,7 +274,8 @@ pub fn render_mirror(
         for j in 0..full.min(half) {
             let y = area.y + (half - 1 - j) as u16;
             let t = (j + 1) as f32 / half as f32;
-            put(buf, sx, y, BLOCKS[7], theme.at_dither(t, sx, y));
+            let glyph = shade_glyph(body_coverage(t), sx, y);
+            put(buf, sx, y, glyph, theme.at_dither(body_color_t(t), sx, y));
         }
         if full < half && frac > 0.06 {
             let y = area.y + (half - 1 - full) as u16;
@@ -253,7 +290,8 @@ pub fn render_mirror(
         for j in 0..full.min(bottom) {
             let y = area.y + (half + j) as u16;
             let t = (j + 1) as f32 / half as f32;
-            put(buf, sx, y, BLOCKS[7], theme.at_dither(t, sx, y));
+            let glyph = shade_glyph(body_coverage(t), sx, y);
+            put(buf, sx, y, glyph, theme.at_dither(body_color_t(t), sx, y));
         }
         if full < bottom && frac > 0.5 {
             let y = area.y + (half + full) as u16;
@@ -421,27 +459,25 @@ mod tests {
         let theme = crate::theme::find("fire").unwrap();
         let area = Rect::new(0, 0, 4, 6);
         let mut buf = Buffer::empty(area);
-        let bars = vec![0.5, 0.5, 0.5, 0.5]; // half of each half -> 1 full + partial
+        let bars = vec![1.0, 1.0, 1.0, 1.0]; // full height both halves
         let mut scratch = RenderScratch::new();
         render_mirror(&mut buf, area, &bars, &theme, &mut scratch);
 
-        // With height 6 (half=3) and v=0.5: filled = 1.5 -> full=1, frac=0.5
-        // on the top: one full block just above center; bottom adds the
-        // same plus an upper-half tip when frac>0.5 (here exactly 0.5, so
-        // no tip). Center rows 2 (top) and 3 (bottom) must be full blocks.
-        assert_eq!(
-            buf[(0, 2)].symbol(),
-            "\u{2588}",
-            "top half grows from center"
+        // Full-height bars: the outermost rows of each half are solid;
+        // center-adjacent rows are airy halftone but never blank.
+        assert_eq!(buf[(0, 0)].symbol(), "\u{2588}", "outer top is solid");
+        assert_eq!(buf[(0, 5)].symbol(), "\u{2588}", "outer bottom is solid");
+        for y in 1..5 {
+            assert_ne!(
+                buf[(0, y)].symbol(),
+                " ",
+                "body cells must never be blank (row {y})"
+            );
+        }
+        assert!(
+            (1..5).any(|y| buf[(0, y)].symbol() != "\u{2588}"),
+            "halftone density must vary across the halves"
         );
-        assert_eq!(
-            buf[(0, 3)].symbol(),
-            "\u{2588}",
-            "bottom half grows from center"
-        );
-        // Nothing outside the mirrored extent.
-        assert_eq!(buf[(0, 0)].symbol(), " ");
-        assert_eq!(buf[(0, 5)].symbol(), " ");
     }
 
     #[test]
@@ -523,10 +559,44 @@ mod tests {
         let mut peaks = Vec::new();
         let mut scratch = RenderScratch::new();
         render_spectrum(&mut buf, area, &bars, &theme, &mut peaks, &mut scratch, DT);
-        // Full-height bars fill the bottom row entirely.
-        let filled = (0..5)
-            .filter(|&x| buf[(x as u16, 3)].symbol() == "\u{2588}")
+        // Full-height bars: the top row is solid, lower rows are airy
+        // halftone but never blank.
+        let solid = (0..5)
+            .filter(|&x| buf[(x as u16, 0)].symbol() == "\u{2588}")
             .count();
-        assert_eq!(filled, 5, "bottom row should be full blocks");
+        assert_eq!(solid, 5, "top row should be full blocks");
+        for y in 1..4 {
+            for x in 0..5u16 {
+                assert_ne!(buf[(x, y)].symbol(), " ", "body cell must never be blank");
+            }
+        }
+    }
+
+    #[test]
+    fn shade_glyph_is_deterministic_and_graduated() {
+        // Pure function of (coverage, x, y): identical repeated calls.
+        for y in 0..6u16 {
+            for x in 0..6u16 {
+                assert_eq!(shade_glyph(0.6, x, y), shade_glyph(0.6, x, y));
+            }
+        }
+        // Extremes: 0 -> blank, 1 -> solid everywhere.
+        for y in 0..4u16 {
+            for x in 0..4u16 {
+                assert_eq!(shade_glyph(0.0, x, y), ' ');
+                assert_eq!(shade_glyph(1.0, x, y), '\u{2588}');
+            }
+        }
+        // Ordered stipple: a mid coverage produces more than one density
+        // level across the Bayer pattern.
+        let mut levels = std::collections::HashSet::new();
+        for y in 0..4u16 {
+            for x in 0..4u16 {
+                levels.insert(shade_glyph(0.55, x, y));
+            }
+        }
+        assert!(levels.len() >= 2, "no stipple: {levels:?}");
+        // Body coverage floor keeps bar interiors non-blank.
+        assert!(body_coverage(0.0) >= 0.35);
     }
 }

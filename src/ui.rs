@@ -23,7 +23,7 @@ use crate::audio::AudioHandle;
 use crate::theme::{self, ColorDepth, Theme};
 use crate::visualizers;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Bars,
     Scope,
@@ -105,7 +105,9 @@ impl App {
             .unwrap_or(0);
         let volume = if audio.is_live() { 0.0 } else { audio.volume() };
         Self {
-            mode: Mode::Bars,
+            // Mirrored spectrum is the default composition: it fills the
+            // field symmetrically, which reads best at every size.
+            mode: Mode::Mirror,
             help: false,
             quit: false,
             paused: false,
@@ -336,9 +338,14 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
     let beat_flash = app.beat_flash;
     let help = app.help;
 
+    // Quiet chrome: the visualization is the star. The border sits at a
+    // low-contrast slate and only flashes toward the theme on beats; the
+    // status chip keeps the single accent pop.
+    let chrome = Color::Rgb(150, 152, 162);
+    let slate_border = Color::Rgb(70, 74, 86);
     let accent = app.themes[theme_idx].accent();
     let beat_color = app.themes[theme_idx].beat();
-    let border = theme::lerp_color(accent, beat_color, beat_flash);
+    let border = theme::lerp_color(slate_border, beat_color, beat_flash);
 
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
     let main = chunks[0];
@@ -348,17 +355,14 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
 
     let mut title_right = vec![
         Span::raw(" "),
-        Span::styled(mode.name(), Style::new().fg(accent)),
+        Span::styled(mode.name(), Style::new().fg(chrome)),
         Span::raw(" "),
     ];
     if beat_flash > 0.5 {
         title_right.push(Span::styled("\u{266A}", Style::new().fg(beat_color)));
     }
 
-    let mut title_left = vec![Span::styled(
-        " SPECTRUM ",
-        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-    )];
+    let mut title_left = vec![Span::styled(" SPECTRUM ", Style::new().fg(chrome))];
     if audio.demo {
         title_left.push(Span::styled(
             " DEMO ",
@@ -399,26 +403,19 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
             dt,
         ),
         Mode::Combo => {
-            visualizers::render_spectrum(
-                f.buffer_mut(),
-                inner,
-                &analysis.bars,
-                theme,
-                peaks,
-                scratch,
-                dt,
-            );
-            // Waveform overlaid on the upper-middle band of the bar field:
-            // bars live near the bottom, so this fills the space they
-            // rarely reach and keeps the trace clearly separated.
-            let wave_h = (inner.height * 2 / 5).clamp(2, inner.height.saturating_sub(1).max(2));
-            let wave_top = inner.height / 6;
-            let wave = Rect::new(
-                inner.x,
-                inner.y + wave_top.min(inner.height.saturating_sub(wave_h)),
-                inner.width,
-                wave_h,
-            );
+            // Integrated composition: mirrored halftone bars fill the
+            // field symmetrically (no dead upper half) and the waveform
+            // rides the mirror's centerline, so the trace and the bars
+            // share a single visual axis instead of floating apart.
+            visualizers::render_mirror(f.buffer_mut(), inner, &analysis.bars, theme, scratch);
+            let half = inner.height / 2;
+            let wave_h = (inner.height / 3).clamp(2, inner.height);
+            // Center the band on the mirror's centerline; bounded so the
+            // rect always stays inside `inner`.
+            let wave_top = half
+                .saturating_sub(wave_h / 2)
+                .min(inner.height.saturating_sub(wave_h));
+            let wave = Rect::new(inner.x, inner.y + wave_top, inner.width, wave_h);
             visualizers::render_oscilloscope(
                 f.buffer_mut(),
                 wave,
@@ -884,6 +881,119 @@ mod tests {
             n_true >= n_256,
             "truecolor ({n_true}) should use at least as many colors as 256 ({n_256})"
         );
+    }
+
+    #[test]
+    fn default_mode_is_mirror() {
+        let app = demo_app();
+        assert_eq!(app.mode, Mode::Mirror);
+    }
+
+    #[test]
+    fn combo_wave_rides_the_mirror_centerline() {
+        // The combo composition: mirrored bars plus a waveform band centered
+        // on the mirror's centerline (integrated axis, no dead upper half).
+        let theme = theme::find_with_depth("spectrum", ColorDepth::True).unwrap();
+        let frame = demo::synthetic_frame(5.0, 64);
+        let area = Rect::new(0, 0, 72, 22);
+        let mut buf = Buffer::empty(area);
+        let mut scratch = RenderScratch::default();
+
+        // Mirror half of the field: the wave band center must match it.
+        crate::visualizers::render_mirror(&mut buf, area, &frame.bars, &theme, &mut scratch);
+        let half = area.height / 2;
+
+        let wave_h = (area.height / 3).clamp(2, area.height);
+        let wave_top = half
+            .saturating_sub(wave_h / 2)
+            .min(area.height.saturating_sub(wave_h));
+        let wave = Rect::new(area.x, area.y + wave_top, area.width, wave_h);
+        crate::visualizers::render_oscilloscope(
+            &mut buf,
+            wave,
+            &frame.waveform,
+            &theme,
+            1.1,
+            &mut scratch,
+        );
+        // The band straddles the centerline.
+        assert!(
+            wave_top <= half && wave_top + wave_h >= half,
+            "wave band must straddle the centerline (top {wave_top}, h {wave_h}, half {half})"
+        );
+        // Braille trace present inside the band.
+        let braille = (wave.x..wave.x + wave.width)
+            .flat_map(|x| (wave.y..wave.y + wave.height).map(move |y| (x, y)))
+            .filter(|(x, y)| {
+                buf[(*x, *y)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+            })
+            .count();
+        assert!(braille > 0, "combo must render the waveform");
+        // No peak-cap markers floating in the composition.
+        let caps = (0..area.width)
+            .flat_map(|x| (0..area.height).map(move |y| (x, y)))
+            .filter(|(x, y)| buf[(*x, *y)].symbol() == "\u{2594}")
+            .count();
+        assert_eq!(caps, 0, "combo must not carry detached peak caps");
+    }
+
+    #[test]
+    fn all_modes_render_across_terminal_sizes() {
+        // Every mode, loud + silence, across the reviewer's size ladder.
+        let theme = theme::find_with_depth("spectrum", ColorDepth::True).unwrap();
+        let loud = demo::synthetic_frame(5.0, 64);
+        let silent = demo::synthetic_frame(7.9, 64);
+        let sizes = [
+            (144u16, 42u16),
+            (100, 30),
+            (72, 22),
+            (40, 12),
+            (20, 8),
+            (300, 50),
+        ];
+        for (w, h) in sizes {
+            let area = Rect::new(0, 0, w, h);
+            let mut scratch = RenderScratch::default();
+            let mut peaks = Vec::new();
+
+            // Mirror (default), bars, scope.
+            let mut buf = Buffer::empty(area);
+            visualizers::render_mirror(&mut buf, area, &loud.bars, &theme, &mut scratch);
+            assert!(nonblank(&buf) > 0, "mirror {w}x{h} empty at loud");
+            let mut buf = Buffer::empty(area);
+            visualizers::render_spectrum(
+                &mut buf,
+                area,
+                &loud.bars,
+                &theme,
+                &mut peaks,
+                &mut scratch,
+                1.0 / 60.0,
+            );
+            assert!(nonblank(&buf) > 0, "bars {w}x{h} empty at loud");
+            let mut buf = Buffer::empty(area);
+            visualizers::render_oscilloscope(
+                &mut buf,
+                area,
+                &loud.waveform,
+                &theme,
+                1.0,
+                &mut scratch,
+            );
+            assert!(nonblank(&buf) > 0, "scope {w}x{h} empty at loud");
+
+            // Silence is intentionally quiet everywhere.
+            let mut buf = Buffer::empty(area);
+            visualizers::render_mirror(&mut buf, area, &silent.bars, &theme, &mut scratch);
+            assert!(
+                nonblank(&buf) <= (w as usize),
+                "mirror {w}x{h} not quiet at silence"
+            );
+        }
     }
 
     fn nonblank(buf: &Buffer) -> usize {

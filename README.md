@@ -68,8 +68,9 @@ spectrum --demo --mode 4 --exit-after 10  # scripted QA / screenshots
 | `-c, --capture` | - | Visualize live audio (see `--source`) |
 | `--demo` | off | Silent synthetic generator; no audio hardware |
 | `--source NAME` | system | `system` (Windows output loopback) or `mic` |
-| `--mode N` | 1 | Start in mode 1-5 (spectrum/scope/spectrogram/combo/mirror) |
+| `--mode N` | 5 | Start in mode 1-5 (spectrum/scope/spectrogram/combo/mirror); the mirrored spectrum is the default composition |
 | `--exit-after SECS` | - | Exit cleanly after N seconds (scripted QA) |
+| `--freeze-at SECS` | - | With `--demo`: pin the synthetic timeline for deterministic, pixel-identical frames |
 | `-t, --theme NAME` | spectrum | spectrum, fire, ice, matrix, vapor |
 | `--bars N` | 64 | Frequency bands (8..=256) |
 | `--sensitivity F` | 1.0 | FFT display gain (0.1..=4.0, must be finite) |
@@ -100,8 +101,9 @@ device and any reconnect state).
 ## Platform notes
 
 - **Windows**: `--capture` opens the default *output* device as a WASAPI
-  loopback input, visualizing whatever the system is playing; it falls
-  back to the microphone when loopback is unavailable.
+  loopback input, visualizing whatever the system is playing. There is no
+  microphone fallback - if loopback cannot open, the error tells you what
+  to try (`--source mic` for explicit microphone capture).
 - **Linux**: capture uses the default input device - select a PulseAudio
   or PipeWire *monitor* source to visualize system playback.
 - **macOS**: only microphone capture is supported (CoreAudio exposes no
