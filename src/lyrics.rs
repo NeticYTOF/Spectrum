@@ -17,7 +17,7 @@
 //! - never blocks the render loop: everything runs on this thread
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -197,6 +197,11 @@ pub fn spawn_lyrics(
     stop: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
     let (tx, rx) = std::sync::mpsc::channel::<LookupRequest>();
+    // The generation of the newest request the watcher has QUEUED. The
+    // executor's in-flight lookup checks it on every wait slice: an
+    // obsolete track's fetch or Retry-After backoff aborts immediately
+    // instead of holding the latest track hostage behind it.
+    let latest_sent = Arc::new(AtomicU64::new(0));
 
     // Watcher: detect identity changes; hand requests to the executor.
     let watcher = std::thread::Builder::new()
@@ -205,6 +210,8 @@ pub fn spawn_lyrics(
             let media = media.clone();
             let lyrics = lyrics.clone();
             let stop = stop.clone();
+            let latest_sent = latest_sent.clone();
+            let tx = tx.clone();
             move || {
                 let mut last_key: Option<TrackKey> = None;
                 let mut generation: u64 = 0;
@@ -237,6 +244,10 @@ pub fn spawn_lyrics(
                                 };
                             }
                             if let Some(k) = request {
+                                // Publish the generation BEFORE the send so
+                                // the executor can see a supersede no later
+                                // than the request itself.
+                                latest_sent.store(generation, Ordering::Release);
                                 let _ = tx.send(LookupRequest { generation, key: k });
                             }
                         }
@@ -252,6 +263,7 @@ pub fn spawn_lyrics(
         .name("spectrum-lyrics-fetch".into())
         .spawn(move || {
             let agent = build_agent();
+            let latest_sent = latest_sent.clone();
             // Terminal statuses (synced/plain/instrumental/no-match) are
             // cached per identity, bounded. Transient failures cool down:
             // the SAME song retries when the deadline passes (bounded,
@@ -321,8 +333,17 @@ pub fn spawn_lyrics(
                             retry_at = Some(now + remaining);
                             LyricsStatus::Error("lyrics rate-limited, waiting".into())
                         } else {
-                            let s =
-                                lookup_interruptible(&agent, &req.key, &stop, &mut provider_gate);
+                            let cancel =
+                                Cancel::with_supersede(&stop, &latest_sent, req.generation);
+                            let Some(s) =
+                                lookup_interruptible(&agent, &req.key, &cancel, &mut provider_gate)
+                            else {
+                                // Superseded (or stopping): a newer request
+                                // is queued. Do NOT cache, schedule a retry
+                                // or apply anything for the obsolete track -
+                                // loop and pick up the latest request.
+                                continue;
+                            };
                             if let LyricsStatus::Error(_) = &s {
                                 // FRESH error: write the deadline once.
                                 cooldowns.insert(req.key.clone(), (s.clone(), now));
@@ -492,14 +513,16 @@ fn build_query(params: &[(&str, &str)]) -> String {
 
 /// The full lookup for one track: `get`, then `search` on 404, with
 /// identity+duration validation and ambiguity rejection. Interruptible:
-/// returns early when `stop` is set (never hangs a quit behind network
-/// or backoff).
+/// returns None when the request was superseded (a newer watcher request
+/// must not wait behind this fetch/backoff) or the app is stopping - in
+/// both cases the result is obsolete and must not be applied, cached or
+/// scheduled for retry.
 fn lookup_interruptible(
     agent: &ureq::Agent,
     key: &TrackKey,
-    stop: &Arc<AtomicBool>,
+    cancel: &Cancel<'_>,
     provider_gate: &mut ProviderGate,
-) -> LyricsStatus {
+) -> Option<LyricsStatus> {
     // Primary: /api/get with everything we know.
     let mut params: Vec<(&str, &str)> = vec![
         ("artist_name", key.artist.as_str()),
@@ -513,18 +536,18 @@ fn lookup_interruptible(
         params.push(("duration", ds));
     }
     let url = format!("{}/api/get?{}", base_url(), build_query(&params));
-    match fetch_record(agent, &url, stop, provider_gate) {
+    match fetch_record(agent, &url, cancel, provider_gate) {
         FetchOutcome::Ok(rec) => {
             if record_matches(key, &rec) {
-                rec.to_status()
+                Some(rec.to_status())
             } else {
                 // The endpoint's best guess is not this track.
-                LyricsStatus::NoMatch
+                Some(LyricsStatus::NoMatch)
             }
         }
-        FetchOutcome::NotFound => search_fallback(agent, key, stop, provider_gate),
-        FetchOutcome::RateLimited => LyricsStatus::Error("lyrics lookup rate limited".into()),
-        FetchOutcome::Failed(e) => LyricsStatus::Error(e),
+        FetchOutcome::NotFound => search_fallback(agent, key, cancel, provider_gate),
+        FetchOutcome::RateLimited => Some(LyricsStatus::Error("lyrics lookup rate limited".into())),
+        FetchOutcome::Failed(e) => Some(LyricsStatus::Error(e)),
     }
 }
 
@@ -532,9 +555,9 @@ fn lookup_interruptible(
 fn search_fallback(
     agent: &ureq::Agent,
     key: &TrackKey,
-    stop: &Arc<AtomicBool>,
+    cancel: &Cancel<'_>,
     provider_gate: &mut ProviderGate,
-) -> LyricsStatus {
+) -> Option<LyricsStatus> {
     let url = format!(
         "{}/api/search?{}",
         base_url(),
@@ -543,17 +566,21 @@ fn search_fallback(
             ("track_name", key.title.as_str()),
         ])
     );
-    match fetch_json_with_429(agent, &url, stop, provider_gate) {
+    match fetch_json_with_429(agent, &url, cancel, provider_gate) {
         FetchBody::Ok(body) => {
             let records: Vec<LrclibRecord> = match serde_json::from_str(&body) {
                 Ok(r) => r,
-                Err(_) => return LyricsStatus::Error("lyrics search returned bad data".into()),
+                Err(_) => {
+                    return Some(LyricsStatus::Error(
+                        "lyrics search returned bad data".into(),
+                    ))
+                }
             };
             let matches: Vec<&LrclibRecord> =
                 records.iter().filter(|r| record_matches(key, r)).collect();
             match matches.len() {
-                0 => LyricsStatus::NoMatch,
-                1 => matches[0].to_status(),
+                0 => Some(LyricsStatus::NoMatch),
+                1 => Some(matches[0].to_status()),
                 _ => {
                     // Ambiguous by artist+title+duration: the known album
                     // can disambiguate (never invents certainty - a
@@ -569,18 +596,18 @@ fn search_fallback(
                             })
                             .collect();
                         if by_album.len() == 1 {
-                            return by_album[0].to_status();
+                            return Some(by_album[0].to_status());
                         }
                     }
                     // Still ambiguous: rather than showing another
                     // track, give up.
-                    LyricsStatus::NoMatch
+                    Some(LyricsStatus::NoMatch)
                 }
             }
         }
-        FetchBody::NotFound => LyricsStatus::NoMatch,
-        FetchBody::RateLimited => LyricsStatus::Error("lyrics lookup rate limited".into()),
-        FetchBody::Failed(e) => LyricsStatus::Error(e),
+        FetchBody::NotFound => Some(LyricsStatus::NoMatch),
+        FetchBody::RateLimited => Some(LyricsStatus::Error("lyrics lookup rate limited".into())),
+        FetchBody::Failed(e) => Some(LyricsStatus::Error(e)),
     }
 }
 
@@ -600,10 +627,10 @@ enum FetchOutcome {
 fn fetch_record(
     agent: &ureq::Agent,
     url: &str,
-    stop: &Arc<AtomicBool>,
+    cancel: &Cancel<'_>,
     provider_gate: &mut ProviderGate,
 ) -> FetchOutcome {
-    match fetch_json_with_429(agent, url, stop, provider_gate) {
+    match fetch_json_with_429(agent, url, cancel, provider_gate) {
         FetchBody::Ok(body) => match serde_json::from_str::<LrclibRecord>(&body) {
             Ok(rec) => FetchOutcome::Ok(rec),
             Err(_) => FetchOutcome::Failed("lyrics response was malformed".into()),
@@ -760,10 +787,59 @@ fn classify_retry(parsed: Option<Duration>, budget: Duration) -> RetryDecision {
 
 /// Sleep that aborts early when `stop` is set. Returns false when the
 /// sleep was interrupted (shut down).
-fn interruptible_sleep(d: Duration, stop: &Arc<AtomicBool>) -> bool {
+/// Cancellation for an in-flight lookup. Two sources:
+/// - the global `stop` flag (quit),
+/// - SUPERSESSION: the watcher queued a newer request (generation >
+///   ours). An obsolete track's fetch or Retry-After backoff must never
+///   hold up the latest track's lookup, so every wait slice and retry
+///   checks this. Bounded: no new threads, and the 429/Retry-After and
+///   identity safeguards are untouched - a newer request simply takes
+///   over the single executor loop.
+#[derive(Clone, Copy)]
+struct Cancel<'a> {
+    stop: &'a AtomicBool,
+    /// (shared latest-sent generation, this request's generation). None:
+    /// never superseded (tests, non-worker callers).
+    supersede: Option<(&'a AtomicU64, u64)>,
+}
+
+impl<'a> Cancel<'a> {
+    /// No supersede source: used by unit tests and the live smoke test.
+    #[cfg(test)]
+    fn stop_only(stop: &'a AtomicBool) -> Self {
+        Self {
+            stop,
+            supersede: None,
+        }
+    }
+
+    fn with_supersede(stop: &'a AtomicBool, latest: &'a AtomicU64, gen: u64) -> Self {
+        Self {
+            stop,
+            supersede: Some((latest, gen)),
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn superseded(&self) -> bool {
+        match self.supersede {
+            Some((latest, gen)) => latest.load(Ordering::Acquire) > gen,
+            None => false,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.stopped() || self.superseded()
+    }
+}
+
+fn interruptible_sleep(d: Duration, cancel: &Cancel<'_>) -> bool {
     let deadline = Instant::now() + d;
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if cancel.cancelled() {
             return false;
         }
         let now = Instant::now();
@@ -777,21 +853,23 @@ fn interruptible_sleep(d: Duration, stop: &Arc<AtomicBool>) -> bool {
 
 /// GET with bounded body. 429s honor the server's Retry-After plus jitter
 /// when it is within the in-fetch wait budget (sleep interruptible by
-/// `stop`, so a quit never hangs behind backoff); a Retry-After ABOVE the
-/// budget sets the PROVIDER-WIDE not-before deadline (`provider_gate`)
-/// to now + the full server value so every subsequent track defers too,
-/// then returns RateLimited. 5xx are transient failures (the cooldown
-/// recovers them), 404 is NotFound, other 4xx are hard failures.
+/// `cancel` - a quit never hangs behind backoff, and a newer queued
+/// request aborts an obsolete track's backoff immediately); a Retry-After
+/// ABOVE the budget sets the PROVIDER-WIDE not-before deadline
+/// (`provider_gate`) to now + the full server value so every subsequent
+/// track defers too, then returns RateLimited. 5xx are transient failures
+/// (the cooldown recovers them), 404 is NotFound, other 4xx are hard
+/// failures.
 fn fetch_json_with_429(
     agent: &ureq::Agent,
     url: &str,
-    stop: &Arc<AtomicBool>,
+    cancel: &Cancel<'_>,
     provider_gate: &mut ProviderGate,
 ) -> FetchBody {
     let mut attempt: u32 = 0;
     loop {
-        if stop.load(Ordering::Relaxed) {
-            return FetchBody::Failed("shutting down".into());
+        if cancel.cancelled() {
+            return FetchBody::Failed("superseded or shutting down".into());
         }
         match agent.get(url).call() {
             Ok(resp) => {
@@ -834,8 +912,8 @@ fn fetch_json_with_429(
                                     .unwrap_or(0)
                                     % 1000) as u64,
                             );
-                            if !interruptible_sleep(base + jitter, stop) {
-                                return FetchBody::Failed("shutting down".into());
+                            if !interruptible_sleep(base + jitter, cancel) {
+                                return FetchBody::Failed("superseded or shutting down".into());
                             }
                             continue;
                         }
@@ -1465,9 +1543,10 @@ mod tests {
     #[test]
     fn interruptible_sleep_aborts_on_stop() {
         let stop = Arc::new(AtomicBool::new(true));
+        let cancel = Cancel::stop_only(&stop);
         // Already stopped: returns immediately without sleeping.
         let start = Instant::now();
-        let completed = interruptible_sleep(Duration::from_secs(30), &stop);
+        let completed = interruptible_sleep(Duration::from_secs(30), &cancel);
         assert!(!completed, "must abort when stop is set");
         assert!(start.elapsed() < Duration::from_secs(2));
     }
@@ -1544,7 +1623,12 @@ mod tests {
         let agent = build_agent();
         let stop = Arc::new(AtomicBool::new(false));
         let mut gate = ProviderGate::new();
-        let body = fetch_json_with_429(&agent, &format!("{}/x", server.url()), &stop, &mut gate);
+        let body = fetch_json_with_429(
+            &agent,
+            &format!("{}/x", server.url()),
+            &Cancel::stop_only(&stop),
+            &mut gate,
+        );
         assert!(matches!(body, FetchBody::RateLimited));
         let rem = gate.remaining(Instant::now());
         assert!(
@@ -1637,6 +1721,84 @@ mod tests {
 
     #[test]
     #[ignore = "networking on localhost; run with --ignored mock_worker"]
+    fn mock_obsolete_backoff_does_not_block_newer_track() {
+        // The reported bug: while the executor sits in track A's 429
+        // Retry-After backoff (within the wait budget, so an in-fetch
+        // sleep), a switch to track B queued behind it must not wait out
+        // A's backoff. The in-flight lookup checks the latest sent
+        // generation on every wait slice and aborts as superseded.
+        let _env = ENV_LOCK.lock().unwrap();
+        let a = key();
+        let b = TrackKey {
+            artist: "Other".into(),
+            title: "Track".into(),
+            album: String::new(),
+            // Matches ok_record_json's duration (180): identity + the 2s
+            // duration guard must both accept the served record.
+            duration_s: Some(180),
+        };
+        let r429_25 = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 25\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let server = MockServer::spawn(vec![
+            r429_25,                          // A's /api/get -> backoff 25s (interruptible)
+            ok_record_json("Track", "Other"), // B's /api/get -> synced
+        ]);
+        std::env::set_var("SPECTRUM_LRCLIB_BASE", server.url());
+
+        let media = crate::media::new_shared();
+        let lyrics = new_shared();
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = spawn_lyrics(media.clone(), lyrics.clone(), stop.clone());
+
+        *media.lock().unwrap() = crate::media::MediaSnapshot {
+            available: true,
+            title: a.title.clone(),
+            artist: a.artist.clone(),
+            album: String::new(),
+            duration_s: a.duration_s.map(|d| d as f64),
+            position_s: 0.0,
+            playing: true,
+        };
+        // Let A's lookup start and reach the backoff sleep (watcher poll
+        // is 300 ms; the fetch is instant against the local mock).
+        std::thread::sleep(Duration::from_millis(800));
+
+        // Switch to B while A's backoff is still running.
+        *media.lock().unwrap() = crate::media::MediaSnapshot {
+            available: true,
+            title: b.title.clone(),
+            artist: b.artist.clone(),
+            album: String::new(),
+            duration_s: b.duration_s.map(|d| d as f64),
+            position_s: 0.0,
+            playing: true,
+        };
+
+        // B's synced lyrics must arrive in a couple of seconds - far under
+        // A's remaining ~24s backoff, which is where the old executor
+        // held B hostage.
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let st = lyrics.lock().unwrap().clone();
+            if matches!(st.status, LyricsStatus::Synced(_)) && st.key.as_ref() == Some(&b) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "B blocked behind A's obsolete backoff: {:?}",
+                st
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            let _ = t.join();
+        }
+        std::env::remove_var("SPECTRUM_LRCLIB_BASE");
+    }
+
+    #[test]
+    #[ignore = "networking on localhost; run with --ignored mock_worker"]
     fn mock_worker_429_defer_sets_provider_gate() {
         let _env = ENV_LOCK.lock().unwrap();
         // A 429 with Retry-After 120 defers the full 120s provider-wide:
@@ -1706,7 +1868,7 @@ mod live_tests {
         // Never-stopping stop flag + fresh provider gate for the smoke test.
         let stop = Arc::new(AtomicBool::new(false));
         let mut gate = ProviderGate::new();
-        match fetch_json_with_429(&agent, &url, &stop, &mut gate) {
+        match fetch_json_with_429(&agent, &url, &Cancel::stop_only(&stop), &mut gate) {
             FetchBody::Ok(body) => {
                 let rec: LrclibRecord = serde_json::from_str(&body).expect("valid LRCLIB record");
                 eprintln!(
@@ -1727,7 +1889,7 @@ mod live_tests {
                         ("track_name", "Amazing Grace"),
                     ])
                 );
-                match fetch_json_with_429(&agent, &surl, &stop, &mut gate) {
+                match fetch_json_with_429(&agent, &surl, &Cancel::stop_only(&stop), &mut gate) {
                     FetchBody::Ok(body) => {
                         // The live API has been observed answering the
                         // search with a JSON object (an error body) instead
