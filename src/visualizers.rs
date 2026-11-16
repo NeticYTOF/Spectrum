@@ -38,12 +38,18 @@ pub struct RenderScratch {
     grid: Vec<u16>,
 }
 
-impl RenderScratch {
-    pub fn new() -> Self {
+impl Default for RenderScratch {
+    fn default() -> Self {
         Self {
             bars: Vec::new(),
             grid: Vec::new(),
         }
+    }
+}
+
+impl RenderScratch {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
