@@ -9,14 +9,19 @@ this file preserves their notices as required.
 
 ascii-garden by Ridit (https://github.com/ridit-jangra/ascii-garden)
 
-The lyrics garden mode ("6") ports the visual feel of ascii-garden - the
-pale paper backdrop, dot-matrix current text, curling blue stems and warm
-flowers growing from/around letters, spring-eased bloom and gentle sway -
-to terminal sub-cell (Braille) rendering. The growth vocabulary
-(spring easing, curling vines, staggered blooms) and the "Paper" palette
-are derived from that implementation, itself a reinterpretation of
-Akshat Agarwal's Type Garden. The Rust implementation here is original;
-no Type Garden assets were used.
+The lyrics garden mode ("6") is a direct port of the rendering
+algorithms of ascii-garden at revision
+f519e85f12a8e47b6c7b73a0d13a85043dedbc40: the role/coverage
+classifier, glyph families, subpixel mask rasterization, letter
+layout and wrap, stem/leaf/rose geometry and growth parameters, sway
+and the "Paper" palette, adapted from Canvas to terminal cells as
+documented in docs/PORT-PLAN.md. ascii-garden is itself a
+reinterpretation of Akshat Agarwal's Type Garden, and its cell-grid
+ASCII approach is adapted from ascii-animals by drewdi /
+DesignerStephen1; those works keep their own licences and copyrights.
+The letterforms here are original bitmap serifs drawn for this
+project; no font files (Playfair Display, Georgia or otherwise) are
+bundled or extracted. No Type Garden assets were used.
 
 MIT License
 
