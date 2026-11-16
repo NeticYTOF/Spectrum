@@ -18,46 +18,9 @@ type Stop = (u8, u8, u8);
 /// 4x4 Bayer matrix for ordered dithering; thresholds tile the screen.
 const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
-/// Ordered-dither a single xterm-256 channel within the 6x6x6 cube.
-fn dither_cube_channel(v: u8, th: f32) -> u8 {
-    let f = v as f32 / 51.0;
-    let lo = f.floor();
-    if f - lo > th {
-        (lo as u8 + 1).min(5)
-    } else {
-        lo as u8
-    }
-}
-
 /// Ordered-dither threshold in [0, 1) for a screen position.
 fn bayer_threshold(x: u16, y: u16) -> f32 {
     (BAYER4[(y % 4) as usize][(x % 4) as usize] as f32 + 0.5) / 16.0
-}
-
-/// Ordered-dither one RGB triple for xterm-256. Near-neutral colors use
-/// the finer 24-step grayscale ramp (232..255) instead of the coarse cube,
-/// which smooths the dark ends of gradients like theme shadows.
-fn dither_p256(rgb: [u8; 3], th: f32) -> Color {
-    let [r, g, b] = rgb;
-    let spread = r.max(g).max(b).saturating_sub(r.min(g).min(b));
-    if spread <= 4 {
-        // Grayscale ramp: 24 entries, 8 + 10*i.
-        let avg = ((r as u16 + g as u16 + b as u16) / 3) as u8;
-        let f = (avg.saturating_sub(8) as f32) / 10.0;
-        let lo = f.floor().min(23.0);
-        let idx = if f - lo > th {
-            (lo + 1.0).min(23.0)
-        } else {
-            lo
-        };
-        Color::Indexed(232 + idx as u8)
-    } else {
-        Color::Indexed(
-            16 + 36 * dither_cube_channel(r, th)
-                + 6 * dither_cube_channel(g, th)
-                + dither_cube_channel(b, th),
-        )
-    }
 }
 
 /// Terminal color depth a theme is rendered for.
@@ -163,22 +126,18 @@ fn nearest_xterm(rgb: [u8; 3]) -> u8 {
     best as u8
 }
 
-/// The two nearest ANSI-16 indices (distinct) and the mix weight of the
-/// second: w is the fraction of the second color an ideal blend would use.
-fn nearest_ansi16_pair(rgb: [u8; 3]) -> (u8, u8, f32) {
-    let mut order: [(f32, usize); 16] = [(0.0, 0); 16];
+/// Nearest ANSI-16 palette index for an RGB color.
+fn nearest_ansi16(rgb: [u8; 3]) -> u8 {
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
     for (i, cand) in ANSI16_RGB.iter().enumerate() {
-        order[i] = (dist2(rgb, *cand), i);
+        let d = dist2(rgb, *cand);
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
     }
-    order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    let (d1, i1) = order[0];
-    let (d2, i2) = order[1];
-    let w = if d1 + d2 <= f32::EPSILON {
-        0.0
-    } else {
-        (d1 / (d1 + d2)).clamp(0.0, 1.0)
-    };
-    (i1 as u8, i2 as u8, w)
+    best as u8
 }
 
 #[derive(Clone)]
@@ -186,15 +145,15 @@ pub struct Theme {
     pub name: &'static str,
     depth: ColorDepth,
     stops: &'static [Stop],
-    /// Depth-quantized gradient lookup (nearest palette color per step).
+    /// Depth-quantized gradient lookup: exact RGB steps for True, nearest
+    /// palette entries for P256/Ansi16. `at_dither` dithers between
+    /// adjacent steps of this same table for every depth.
     gradient: Vec<Color>,
-    /// For Ansi16: per-step (primary, secondary, mix weight) so dithering
-    /// can pick between the two nearest palette entries. Empty otherwise.
-    dither_pairs: Vec<(u8, u8, f32)>,
 }
 
 impl Theme {
     /// Color at intensity `t` (0.0 = dim, 1.0 = hot). Clamped, panic-free.
+    /// Quantized to the nearest gradient step; used for text/UI chrome.
     pub fn at(&self, t: f32) -> Color {
         if self.gradient.is_empty() {
             return Color::White;
@@ -204,28 +163,27 @@ impl Theme {
         self.gradient[idx.min(last)]
     }
 
-    /// Color at intensity `t` for the screen position (x, y), with ordered
-    /// dithering applied for limited color depths. True-color themes
-    /// return the exact gradient color, unchanged.
+    /// Color at intensity `t` for the screen position (x, y): an ordered
+    /// 4x4 Bayer dither between the two adjacent gradient steps bracketing
+    /// `t`. This is the signature spectrum look - the deliberate stipple
+    /// that dissolves banding into a fine halftone - and it applies in
+    /// EVERY color depth (truecolor included). The result is a pure
+    /// function of (t, x, y): temporally stable, no per-frame noise, and
+    /// text chrome keeps the exact `at()` colors.
     pub fn at_dither(&self, t: f32, x: u16, y: u16) -> Color {
-        match self.depth {
-            ColorDepth::True => self.at(t),
-            ColorDepth::P256 => {
-                let rgb = to_rgb(sample_stops(self.stops, t));
-                dither_p256(rgb, bayer_threshold(x, y))
-            }
-            ColorDepth::Ansi16 => {
-                let step = self.gradient_step(t);
-                let (c1, c2, w) = self.dither_pairs[step.min(self.dither_pairs.len() - 1)];
-                let th = bayer_threshold(x, y);
-                Color::Indexed(if w > th { c2 } else { c1 })
-            }
+        let n = self.gradient.len();
+        if n == 0 {
+            return Color::White;
         }
-    }
-
-    fn gradient_step(&self, t: f32) -> usize {
-        let last = self.gradient.len().saturating_sub(1);
-        (t.clamp(0.0, 1.0) * last as f32).round() as usize
+        let pos = t.clamp(0.0, 1.0) * (n - 1) as f32;
+        let i = pos.floor() as usize;
+        let th = bayer_threshold(x, y);
+        let j = if pos - i as f32 > th {
+            (i + 1).min(n - 1)
+        } else {
+            i
+        };
+        self.gradient[j]
     }
 
     /// Mid-high accent used for UI chrome (titles, borders, status).
@@ -320,25 +278,15 @@ fn build_theme(name: &'static str, stops: &'static [Stop], depth: ColorDepth) ->
             match depth {
                 ColorDepth::True => Color::Rgb(rgb[0], rgb[1], rgb[2]),
                 ColorDepth::P256 => Color::Indexed(nearest_xterm(rgb)),
-                ColorDepth::Ansi16 => Color::Indexed(nearest_ansi16_pair(rgb).0),
+                ColorDepth::Ansi16 => Color::Indexed(nearest_ansi16(rgb)),
             }
         })
         .collect();
-    let dither_pairs = match depth {
-        ColorDepth::Ansi16 => (0..GRADIENT_STEPS)
-            .map(|i| {
-                let rgb = to_rgb(sample_stops(stops, i as f32 / (GRADIENT_STEPS - 1) as f32));
-                nearest_ansi16_pair(rgb)
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
     Theme {
         name,
         depth,
         stops,
         gradient,
-        dither_pairs,
     }
 }
 
@@ -430,25 +378,17 @@ mod tests {
     }
 
     #[test]
-    fn p256_dither_uses_ramp_for_neutral_grays() {
-        // A dark neutral gray below the cube's floor dithers in the
-        // grayscale ramp (232..255), not the cube.
-        let lo = dither_p256([10, 10, 10], 0.1);
-        let hi = dither_p256([10, 10, 10], 0.9);
-        assert!(matches!(lo, Color::Indexed(i) if i >= 232), "{lo:?}");
-        assert!(matches!(hi, Color::Indexed(i) if i >= 232), "{hi:?}");
-        assert_ne!(lo, hi, "dithering must vary with threshold");
-
-        // Mid neutral gray: both ends stay in the ramp.
-        let a = dither_p256([139, 138, 137], 0.2);
-        assert!(matches!(a, Color::Indexed(i) if i >= 232), "{a:?}");
-
-        // Tinted colors stay in the cube (16..232).
-        let tinted = dither_p256([200, 60, 30], 0.5);
-        assert!(
-            matches!(tinted, Color::Indexed(i) if (16..232).contains(&i)),
-            "{tinted:?}"
-        );
+    fn p256_dark_gradient_entries_use_ramp_when_neutral() {
+        // Baked gradient entries are nearest-palette: fire's near-black
+        // (12,4,4) reddish step still maps into the cube/ramp sensibly and
+        // every entry stays a valid xterm index.
+        let t = find_with_depth("fire", ColorDepth::P256).unwrap();
+        for i in 0..GRADIENT_STEPS {
+            assert!(matches!(t.gradient[i], Color::Indexed(_)));
+        }
+        // A genuinely neutral dark gray maps into the ramp (>= 232).
+        assert_eq!(nearest_xterm([10, 10, 10]), 232);
+        assert_eq!(nearest_xterm([139, 139, 139]), 245);
     }
 
     #[test]
@@ -476,12 +416,47 @@ mod tests {
     }
 
     #[test]
-    fn truecolor_at_dither_is_exact() {
+    fn truecolor_dither_is_visible_and_stable() {
+        // The dither treatment must be present in DEFAULT truecolor: an
+        // intensity between gradient steps dithers to both adjacent steps
+        // across the 16 Bayer positions...
         let t = find("fire").unwrap();
-        for i in 0..=10 {
-            let tt = i as f32 / 10.0;
-            assert_eq!(t.at_dither(tt, 0, 0), t.at(tt));
-            assert_eq!(t.at_dither(tt, 123, 45), t.at(tt));
+        let mut seen = std::collections::HashSet::new();
+        for y in 0..4u16 {
+            for x in 0..4u16 {
+                seen.insert(t.at_dither(0.33, x, y));
+            }
+        }
+        assert!(
+            seen.len() >= 2,
+            "truecolor dither must produce a stipple, got {seen:?}"
+        );
+        // ...and each result must be one of the two bracketing steps.
+        let pos = 0.33 * (GRADIENT_STEPS - 1) as f32;
+        let i = pos.floor() as usize;
+        for c in seen {
+            assert!(
+                c == t.gradient[i] || c == t.gradient[(i + 1).min(GRADIENT_STEPS - 1)],
+                "dither color {c:?} outside steps {i}..={}",
+                i + 1
+            );
+        }
+
+        // Temporal stability: a pure function of (t, x, y) - repeated
+        // calls return identical colors.
+        for y in 0..4u16 {
+            for x in 0..4u16 {
+                assert_eq!(t.at_dither(0.42, x, y), t.at_dither(0.42, x, y));
+            }
+        }
+
+        // At an exact step boundary every position agrees (no glitter on
+        // pure intensities) and equals at().
+        let step = 20.0 / (GRADIENT_STEPS - 1) as f32;
+        for y in 0..4u16 {
+            for x in 0..4u16 {
+                assert_eq!(t.at_dither(step, x, y), t.at(step));
+            }
         }
     }
 
@@ -502,15 +477,16 @@ mod tests {
     }
 
     #[test]
-    fn p256_gradient_is_indexed_and_dither_stays_in_cube() {
+    fn p256_gradient_is_indexed_and_dither_stays_in_palette() {
         let t = find_with_depth("fire", ColorDepth::P256).unwrap();
         for i in 0..GRADIENT_STEPS {
             assert!(matches!(t.gradient[i], Color::Indexed(_)));
         }
-        // Dither output always lands inside the cube (16..=231).
+        // Dither output is always one of the baked gradient entries,
+        // hence a valid xterm index.
         for i in 0..=16 {
             match t.at_dither(i as f32 / 16.0, 3, 7) {
-                Color::Indexed(idx) => assert!((16..232).contains(&idx), "idx {idx}"),
+                Color::Indexed(idx) => assert!(idx <= 255, "idx {idx}"),
                 other => panic!("expected Indexed, got {other:?}"),
             }
         }
@@ -531,17 +507,30 @@ mod tests {
 
     #[test]
     fn ansi16_dither_varies_with_position() {
-        // Some intensity must dither to different palette entries at
-        // different positions, otherwise the pattern is not applied.
+        // Across a multi-hue gradient some intensities sit between two
+        // steps that quantize to different ANSI entries; at those points
+        // the Bayer pattern must produce both colors.
         let t = find_with_depth("vapor", ColorDepth::Ansi16).unwrap();
-        let mut seen = std::collections::HashSet::new();
-        for y in 0..4u16 {
-            for x in 0..4u16 {
-                if let Color::Indexed(idx) = t.at_dither(0.35, x, y) {
-                    seen.insert(idx);
+        let mut found_variance = false;
+        let mut probe = 0;
+        for si in 0..GRADIENT_STEPS {
+            // Probe mid-way between steps (fraction ~0.5).
+            let tt = (si as f32 + 0.5) / (GRADIENT_STEPS - 1) as f32;
+            let mut seen = std::collections::HashSet::new();
+            for y in 0..4u16 {
+                for x in 0..4u16 {
+                    seen.insert(t.at_dither(tt, x, y));
                 }
             }
+            if seen.len() >= 2 {
+                found_variance = true;
+                break;
+            }
+            probe += 1;
         }
-        assert!(seen.len() >= 2, "expected dither variance, got {seen:?}");
+        assert!(
+            found_variance,
+            "dither variance expected somewhere in the gradient (probed {probe} steps)"
+        );
     }
 }
