@@ -92,10 +92,9 @@ pub struct App {
     themes: Vec<Theme>,
     theme_idx: usize,
     depth: ColorDepth,
-    /// Garden bookkeeping: the current lyric line and when it changed
-    /// (drives bloom), plus smoothed energy for the sway.
-    lyric_line: Option<usize>,
-    lyric_changed_at: Instant,
+    /// Garden bookkeeping: smoothed energy for the sway. Bloom age and
+    /// line identity derive from the media position itself, so frozen
+    /// demos render deterministically.
     sway_energy: f32,
 }
 
@@ -132,8 +131,6 @@ impl App {
             themes,
             theme_idx,
             depth,
-            lyric_line: None,
-            lyric_changed_at: Instant::now(),
             sway_energy: 0.0,
         }
     }
@@ -694,28 +691,46 @@ fn render_lyrics(
     let energy_now: f32 = analysis.bars.iter().sum::<f32>() / analysis.bars.len().max(1) as f32;
     app.sway_energy += (energy_now - app.sway_energy) * (1.0 - (-8.0 * dt).exp());
 
-    // Map the lyrics state into the garden view.
     use crate::garden::GardenState;
     use crate::lyrics::LyricsStatus;
 
-    let (garden_state, lines, plain, current) = match &state.status {
-        LyricsStatus::Unavailable => (GardenState::Unavailable, None, None, None),
-        LyricsStatus::Loading => (GardenState::Loading, None, None, None),
-        LyricsStatus::Synced(lines) => (GardenState::Synced, Some(lines.clone()), None, {
-            crate::lrc::line_at(lines, snap.position_s)
-        }),
-        LyricsStatus::Plain(text) => (GardenState::Plain, None, Some(text.clone()), None),
-        LyricsStatus::Instrumental => (GardenState::Instrumental, None, None, None),
-        LyricsStatus::NoMatch => (GardenState::NoMatch, None, None, None),
-        LyricsStatus::Error(e) => (GardenState::Error(e.clone()), None, None, None),
-    };
+    // Identity gate: the lyrics state is only rendered while the CURRENT
+    // media identity matches it. A track change clears instantly (the
+    // watcher also resets the state, but this gate guarantees old words
+    // never display under a new song even while a lookup is pending).
+    let media_key = crate::lyrics::TrackKey::from_snapshot(&snap);
+    let identity_ok = media_key.is_some() && state.key == media_key;
 
-    // Track line changes for the bloom animation.
-    if current != app.lyric_line {
-        app.lyric_line = current;
-        app.lyric_changed_at = Instant::now();
-    }
-    let since = app.lyric_changed_at.elapsed().as_secs_f32();
+    let (garden_state, lines, plain, current, since) = if !identity_ok {
+        // No session, or the state belongs to a previous track: show the
+        // honest per-media state, never stale words.
+        if media_key.is_none() {
+            (GardenState::Unavailable, None, None, None, 5.0)
+        } else {
+            (GardenState::Loading, None, None, None, 0.0)
+        }
+    } else {
+        match &state.status {
+            LyricsStatus::Unavailable => (GardenState::Unavailable, None, None, None, 5.0),
+            LyricsStatus::Loading => (GardenState::Loading, None, None, None, 0.0),
+            LyricsStatus::Synced(lines) => {
+                let idx = crate::lrc::line_at(lines, snap.position_s);
+                // Bloom age derives from the track timeline (position -
+                // line start), so a frozen demo freezes the bloom too;
+                // line/track identity changes reset it inherently because
+                // the new line's start time anchors the age again.
+                let since = match idx {
+                    Some(i) => ((snap.position_s - lines[i].time_s).max(0.0)) as f32,
+                    None => 5.0,
+                };
+                (GardenState::Synced, Some(lines.clone()), None, idx, since)
+            }
+            LyricsStatus::Plain(text) => (GardenState::Plain, None, Some(text.clone()), None, 5.0),
+            LyricsStatus::Instrumental => (GardenState::Instrumental, None, None, None, 5.0),
+            LyricsStatus::NoMatch => (GardenState::NoMatch, None, None, None, 5.0),
+            LyricsStatus::Error(e) => (GardenState::Error(e.clone()), None, None, None, 5.0),
+        }
+    };
 
     let lines_ref = lines.as_deref();
     let view = crate::garden::GardenView {

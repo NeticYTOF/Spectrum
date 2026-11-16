@@ -197,12 +197,14 @@ fn main() -> Result<()> {
         worker_threads.push(analyzer);
         let media_thread = spectrum::media::spawn_media(media_shared.clone(), stop.clone());
         worker_threads.push(media_thread);
-        let lyrics_thread = spectrum::lyrics::spawn_lyrics(
+        let lyrics_threads = spectrum::lyrics::spawn_lyrics(
             media_shared.clone(),
             lyrics_shared.clone(),
             stop.clone(),
         );
-        worker_threads.push(lyrics_thread);
+        for t in lyrics_threads {
+            worker_threads.push(t);
+        }
         let r = ui::run(spectrum::ui::RunConfig {
             shared: &shared,
             audio: &handle,

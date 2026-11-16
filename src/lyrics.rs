@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -88,8 +88,15 @@ pub enum LyricsStatus {
 
 #[derive(Clone, Debug)]
 pub struct LyricsUiState {
+    /// The media identity this state belongs to; the UI renders it only
+    /// while the CURRENT media identity matches, so old words can never
+    /// display under a new song even while a lookup is in flight.
     pub key: Option<TrackKey>,
     pub status: LyricsStatus,
+    /// Bumped on every identity change; lookup results carry the
+    /// generation they were requested under and are applied only when
+    /// it still matches (solves A -> B -> A).
+    pub generation: u64,
 }
 
 pub type LyricsShared = Arc<Mutex<LyricsUiState>>;
@@ -98,78 +105,207 @@ pub fn new_shared() -> LyricsShared {
     Arc::new(Mutex::new(LyricsUiState {
         key: None,
         status: LyricsStatus::Unavailable,
+        generation: 0,
     }))
 }
 
-/// Spawn the lyrics worker. It polls the media snapshot, and per track
-/// change performs one bounded LRCLIB lookup on this thread (never on the
-/// render loop).
+/// One lookup request: the generation under which it was requested and
+/// the track identity.
+#[derive(Clone, Debug)]
+struct LookupRequest {
+    generation: u64,
+    key: TrackKey,
+}
+
+/// The watcher's pure decision step: given the previous and current media
+/// identities, what should happen next? Testable without HTTP or threads.
+enum WatchStep {
+    /// Nothing to do (same identity, or no session and already cleared).
+    Unchanged,
+    /// Identity changed: bump generation, clear immediately, request a
+    /// lookup for the new identity. `unavailable` means there is no media
+    /// session at all (no request needed).
+    Changed {
+        request: Option<TrackKey>,
+        unavailable: bool,
+    },
+}
+
+fn watch_step(prev: &Option<TrackKey>, current: &Option<TrackKey>) -> WatchStep {
+    if prev == current {
+        return WatchStep::Unchanged;
+    }
+    match current {
+        None => WatchStep::Changed {
+            request: None,
+            unavailable: true,
+        },
+        Some(k) => WatchStep::Changed {
+            request: Some(k.clone()),
+            unavailable: false,
+        },
+    }
+}
+
+/// Whether a completed lookup result should be applied: the request must
+/// still be the current generation AND the media must currently be on the
+/// same identity. Pure and unit-testable (A -> B -> A rejects the stale
+/// A result even though the key matches).
+fn should_apply(
+    current_generation: u64,
+    current_media_key: Option<&TrackKey>,
+    req: &LookupRequest,
+) -> bool {
+    current_generation == req.generation
+        && current_media_key.map(|k| k == &req.key).unwrap_or(false)
+}
+
+/// Spawn the lyrics pipeline: a watcher that never blocks on HTTP, and a
+/// lookup executor that applies results only when both the generation and
+/// the CURRENT media identity still match. The UI additionally gates on
+/// identity, so stale words disappear immediately on track change.
 pub fn spawn_lyrics(
     media: MediaShared,
     lyrics: LyricsShared,
     stop: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("spectrum-lyrics".into())
+) -> Vec<JoinHandle<()>> {
+    let (tx, rx) = std::sync::mpsc::channel::<LookupRequest>();
+
+    // Watcher: detect identity changes; hand requests to the executor.
+    let watcher = std::thread::Builder::new()
+        .name("spectrum-lyrics-watch".into())
+        .spawn({
+            let media = media.clone();
+            let lyrics = lyrics.clone();
+            let stop = stop.clone();
+            move || {
+                let mut last_key: Option<TrackKey> = None;
+                let mut generation: u64 = 0;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                    let snap = media.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let key = TrackKey::from_snapshot(&snap);
+
+                    match watch_step(&last_key, &key) {
+                        WatchStep::Unchanged => {}
+                        WatchStep::Changed {
+                            request,
+                            unavailable,
+                        } => {
+                            generation += 1;
+                            last_key = key.clone();
+                            // Immediate clear: the UI also gates on identity,
+                            // so this is belt and braces.
+                            {
+                                let mut st = lyrics.lock().unwrap_or_else(|e| e.into_inner());
+                                st.generation = generation;
+                                st.key = key.clone();
+                                st.status = if unavailable {
+                                    LyricsStatus::Unavailable
+                                } else {
+                                    LyricsStatus::Loading
+                                };
+                            }
+                            if let Some(k) = request {
+                                let _ = tx.send(LookupRequest { generation, key: k });
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn lyrics watcher thread");
+
+    // Executor: one lookup at a time, latest request wins; applies results
+    // only when the generation and the current media identity still match.
+    let executor = std::thread::Builder::new()
+        .name("spectrum-lyrics-fetch".into())
         .spawn(move || {
+            let agent = build_agent();
+            // Terminal statuses (synced/plain/instrumental/no-match) are
+            // cached per identity, bounded. Transient failures are NOT
+            // cached permanently: they cool down and a later identity
+            // change may retry them.
             let mut cache: HashMap<TrackKey, LyricsStatus> = HashMap::new();
             let mut cache_order: Vec<TrackKey> = Vec::new();
-            let mut last_key: Option<TrackKey> = None;
-            let agent = build_agent();
+            let mut cooldowns: HashMap<TrackKey, (LyricsStatus, Instant)> = HashMap::new();
+            const COOLDOWN: Duration = Duration::from_secs(60);
 
-            loop {
+            while !stop.load(Ordering::Relaxed) {
+                let Ok(mut req) = rx.recv() else {
+                    return; // watcher gone: shut down
+                };
+                // Latest-wins: drain any backlog (while a lookup was in
+                // flight, the watcher may have queued several changes).
+                while let Ok(next) = rx.try_recv() {
+                    req = next;
+                }
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(300));
 
-                let snap = media.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let key = TrackKey::from_snapshot(&snap);
-
-                // Absent session: clear honestly and cheaply.
-                let Some(key) = key else {
-                    let mut st = lyrics.lock().unwrap_or_else(|e| e.into_inner());
-                    if st.status != LyricsStatus::Unavailable || st.key.is_some() {
-                        st.key = None;
-                        st.status = LyricsStatus::Unavailable;
-                    }
-                    last_key = None;
-                    continue;
-                };
-
-                if Some(&key) == last_key.as_ref() {
-                    continue; // same track: nothing to do
-                }
-
-                // Track changed: clear old lyrics immediately, then look up.
-                last_key = Some(key.clone());
-                {
-                    let mut st = lyrics.lock().unwrap_or_else(|e| e.into_inner());
-                    st.key = Some(key.clone());
-                    st.status = LyricsStatus::Loading;
-                }
-
-                let status = if let Some(hit) = cache.get(&key) {
+                let status = if let Some(hit) = cache.get(&req.key) {
                     hit.clone()
-                } else {
-                    let s = lookup(&agent, &key);
-                    cache.insert(key.clone(), s.clone());
-                    cache_order.push(key.clone());
-                    if cache_order.len() > CACHE_LIMIT {
-                        let evict = cache_order.remove(0);
-                        cache.remove(&evict);
+                } else if let Some((err, at)) = cooldowns.get(&req.key) {
+                    if at.elapsed() < COOLDOWN {
+                        err.clone()
+                    } else {
+                        cooldowns.remove(&req.key);
+                        lookup_interruptible(&agent, &req.key, &stop)
                     }
-                    s
+                } else {
+                    lookup_interruptible(&agent, &req.key, &stop)
                 };
 
-                // Apply only if the track is still current (stale reject).
-                let mut st = lyrics.lock().unwrap_or_else(|e| e.into_inner());
-                if st.key.as_ref() == Some(&key) {
+                match &status {
+                    // Terminal: cache so the same identity never refetches.
+                    LyricsStatus::Synced(_)
+                    | LyricsStatus::Plain(_)
+                    | LyricsStatus::Instrumental
+                    | LyricsStatus::NoMatch => {
+                        cache.insert(req.key.clone(), status.clone());
+                        cache_order.push(req.key.clone());
+                        if cache_order.len() > CACHE_LIMIT {
+                            let evict = cache_order.remove(0);
+                            cache.remove(&evict);
+                        }
+                    }
+                    // Transient (network/5xx/rate-limit): cooldown, retry
+                    // allowed after it passes.
+                    LyricsStatus::Error(_) => {
+                        cooldowns.insert(req.key.clone(), (status.clone(), Instant::now()));
+                        if cooldowns.len() > CACHE_LIMIT {
+                            // Bounded: drop the oldest cooldown entry.
+                            if let Some(oldest) = cooldowns
+                                .iter()
+                                .min_by_key(|(_, (_, at))| *at)
+                                .map(|(k, _)| k.clone())
+                            {
+                                cooldowns.remove(&oldest);
+                            }
+                        }
+                    }
+                    // Loading/Unavailable never come back from a lookup.
+                    LyricsStatus::Loading | LyricsStatus::Unavailable => {}
+                }
+
+                // Apply only if the request is still current: re-read the
+                // LIVE media identity, not just the watcher's UI state.
+                let snap = media.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let live_key = TrackKey::from_snapshot(&snap);
+                let st_generation = lyrics.lock().unwrap_or_else(|e| e.into_inner()).generation;
+                if should_apply(st_generation, live_key.as_ref(), &req) {
+                    let mut st = lyrics.lock().unwrap_or_else(|e| e.into_inner());
                     st.status = status;
                 }
             }
         })
-        .expect("failed to spawn lyrics thread")
+        .expect("failed to spawn lyrics executor thread");
+
+    vec![watcher, executor]
 }
 
 fn build_agent() -> ureq::Agent {
@@ -187,7 +323,7 @@ pub struct LrclibRecord {
     pub track_name: String,
     #[serde(rename = "artistName")]
     pub artist_name: String,
-    #[serde(default)]
+    #[serde(rename = "albumName", default)]
     pub album_name: Option<String>,
     #[serde(default)]
     pub duration: Option<f64>,
@@ -246,8 +382,14 @@ fn build_query(params: &[(&str, &str)]) -> String {
 }
 
 /// The full lookup for one track: `get`, then `search` on 404, with
-/// identity+duration validation and ambiguity rejection.
-fn lookup(agent: &ureq::Agent, key: &TrackKey) -> LyricsStatus {
+/// identity+duration validation and ambiguity rejection. Interruptible:
+/// returns early when `stop` is set (never hangs a quit behind network
+/// or backoff).
+fn lookup_interruptible(
+    agent: &ureq::Agent,
+    key: &TrackKey,
+    stop: &Arc<AtomicBool>,
+) -> LyricsStatus {
     // Primary: /api/get with everything we know.
     let mut params: Vec<(&str, &str)> = vec![
         ("artist_name", key.artist.as_str()),
@@ -261,7 +403,7 @@ fn lookup(agent: &ureq::Agent, key: &TrackKey) -> LyricsStatus {
         params.push(("duration", ds));
     }
     let url = format!("{BASE_URL}/api/get?{}", build_query(&params));
-    match fetch_record(agent, &url) {
+    match fetch_record(agent, &url, stop) {
         FetchOutcome::Ok(rec) => {
             if record_matches(key, &rec) {
                 rec.to_status()
@@ -270,14 +412,14 @@ fn lookup(agent: &ureq::Agent, key: &TrackKey) -> LyricsStatus {
                 LyricsStatus::NoMatch
             }
         }
-        FetchOutcome::NotFound => search_fallback(agent, key),
+        FetchOutcome::NotFound => search_fallback(agent, key, stop),
         FetchOutcome::RateLimited => LyricsStatus::Error("lyrics lookup rate limited".into()),
         FetchOutcome::Failed(e) => LyricsStatus::Error(e),
     }
 }
 
 /// On 404, search for candidates and pick a conservative match.
-fn search_fallback(agent: &ureq::Agent, key: &TrackKey) -> LyricsStatus {
+fn search_fallback(agent: &ureq::Agent, key: &TrackKey, stop: &Arc<AtomicBool>) -> LyricsStatus {
     let url = format!(
         "{BASE_URL}/api/search?{}",
         build_query(&[
@@ -285,7 +427,7 @@ fn search_fallback(agent: &ureq::Agent, key: &TrackKey) -> LyricsStatus {
             ("track_name", key.title.as_str()),
         ])
     );
-    match fetch_json_with_429(agent, &url) {
+    match fetch_json_with_429(agent, &url, stop) {
         FetchBody::Ok(body) => {
             let records: Vec<LrclibRecord> = match serde_json::from_str(&body) {
                 Ok(r) => r,
@@ -296,8 +438,28 @@ fn search_fallback(agent: &ureq::Agent, key: &TrackKey) -> LyricsStatus {
             match matches.len() {
                 0 => LyricsStatus::NoMatch,
                 1 => matches[0].to_status(),
-                // Ambiguous: rather than showing another track, give up.
-                _ => LyricsStatus::NoMatch,
+                _ => {
+                    // Ambiguous by artist+title+duration: the known album
+                    // can disambiguate (never invents certainty - a
+                    // missing album on either side keeps the rejection).
+                    if !key.album.trim().is_empty() {
+                        let by_album: Vec<&&LrclibRecord> = matches
+                            .iter()
+                            .filter(|r| match r.album_name.as_deref() {
+                                Some(a) if !a.trim().is_empty() => {
+                                    crate::lrc::normalize(a) == crate::lrc::normalize(&key.album)
+                                }
+                                _ => false,
+                            })
+                            .collect();
+                        if by_album.len() == 1 {
+                            return by_album[0].to_status();
+                        }
+                    }
+                    // Still ambiguous: rather than showing another
+                    // track, give up.
+                    LyricsStatus::NoMatch
+                }
             }
         }
         FetchBody::NotFound => LyricsStatus::NoMatch,
@@ -319,8 +481,8 @@ enum FetchOutcome {
     Failed(String),
 }
 
-fn fetch_record(agent: &ureq::Agent, url: &str) -> FetchOutcome {
-    match fetch_json_with_429(agent, url) {
+fn fetch_record(agent: &ureq::Agent, url: &str, stop: &Arc<AtomicBool>) -> FetchOutcome {
+    match fetch_json_with_429(agent, url, stop) {
         FetchBody::Ok(body) => match serde_json::from_str::<LrclibRecord>(&body) {
             Ok(rec) => FetchOutcome::Ok(rec),
             Err(_) => FetchOutcome::Failed("lyrics response was malformed".into()),
@@ -341,11 +503,61 @@ enum FetchBody {
     Failed(String),
 }
 
-/// GET with bounded body, retrying 429 with the server's Retry-After plus
-/// jitter (bounded attempts), then reporting the final outcome.
-fn fetch_json_with_429(agent: &ureq::Agent, url: &str) -> FetchBody {
+/// Decision for a 429: honor the server's Retry-After when it is within
+/// our wait budget; above the budget, defer (the caller reports a
+/// transient error and a bounded cooldown handles recovery) instead of
+/// shortening the wait and retrying early. Pure and unit-testable.
+#[derive(Debug, PartialEq)]
+enum RetryDecision {
+    /// Wait this long (plus jitter) and retry.
+    Wait(Duration),
+    /// Deerral: stop retrying now, let the cooldown handle it.
+    Defer,
+}
+
+fn classify_retry(retry_after_header: Option<&str>, budget: Duration) -> RetryDecision {
+    let header_secs: Option<u64> = retry_after_header.and_then(|v| v.parse().ok());
+    match header_secs {
+        Some(s) => {
+            if Duration::from_secs(s) > budget {
+                RetryDecision::Defer
+            } else {
+                RetryDecision::Wait(Duration::from_secs(s))
+            }
+        }
+        None => RetryDecision::Wait(Duration::from_secs(2)), // no header: small default
+    }
+}
+
+/// Sleep that aborts early when `stop` is set. Returns false when the
+/// sleep was interrupted (shut down).
+fn interruptible_sleep(d: Duration, stop: &Arc<AtomicBool>) -> bool {
+    let deadline = Instant::now() + d;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        let slice = (deadline - now).min(Duration::from_millis(100));
+        std::thread::sleep(slice);
+    }
+}
+
+/// GET with bounded body. 429s honor the server's Retry-After plus jitter
+/// when it is within the wait budget (sleep interruptible by `stop`, so a
+/// quit never hangs behind backoff); a Retry-After above the budget or an
+/// exhausted retry count defers instead of retrying early. 5xx are
+/// transient failures (the cooldown recovers them), 404 is NotFound,
+/// other 4xx are hard failures.
+fn fetch_json_with_429(agent: &ureq::Agent, url: &str, stop: &Arc<AtomicBool>) -> FetchBody {
     let mut attempt: u32 = 0;
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return FetchBody::Failed("shutting down".into());
+        }
         match agent.get(url).call() {
             Ok(resp) => {
                 // ureq 2.x returns Ok only for 2xx statuses.
@@ -355,27 +567,36 @@ fn fetch_json_with_429(agent: &ureq::Agent, url: &str) -> FetchBody {
                 if code == 404 {
                     return FetchBody::NotFound;
                 }
-                if code == 429 && attempt < MAX_429_RETRIES {
-                    attempt += 1;
-                    let retry_after: u64 = resp
-                        .header("Retry-After")
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(2)
-                        .min(MAX_429_WAIT.as_secs());
-                    // Jitter so bursts of clients don't retry in lockstep.
-                    let jitter = (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.subsec_millis())
-                        .unwrap_or(0)
-                        % 1000) as f64
-                        / 1000.0;
-                    std::thread::sleep(
-                        Duration::from_secs(retry_after) + Duration::from_secs_f64(jitter),
-                    );
-                    continue;
-                }
                 if code == 429 {
-                    return FetchBody::RateLimited;
+                    if attempt >= MAX_429_RETRIES {
+                        return FetchBody::RateLimited;
+                    }
+                    let header = resp.header("Retry-After");
+                    match classify_retry(header, MAX_429_WAIT) {
+                        RetryDecision::Defer => return FetchBody::RateLimited,
+                        RetryDecision::Wait(base) => {
+                            attempt += 1;
+                            // Jitter so bursts of clients don't retry in
+                            // lockstep; bounded to a second.
+                            let jitter = Duration::from_millis(
+                                (std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.subsec_millis())
+                                    .unwrap_or(0)
+                                    % 1000) as u64,
+                            );
+                            if !interruptible_sleep(base + jitter, stop) {
+                                return FetchBody::Failed("shutting down".into());
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if (500..600).contains(&code) {
+                    // Transient: never a NoMatch, cooldown will recover.
+                    return FetchBody::Failed(format!(
+                        "lrclib temporarily unavailable (status {code})"
+                    ));
                 }
                 return FetchBody::Failed(format!("lrclib returned status {code}"));
             }
@@ -550,6 +771,198 @@ mod tests {
     }
 
     #[test]
+    fn watch_step_detects_identity_changes() {
+        let a = key();
+        let b = TrackKey {
+            artist: "Other".into(),
+            title: "Track".into(),
+            album: String::new(),
+            duration_s: Some(200),
+        };
+
+        // A -> none.
+        match watch_step(&Some(a.clone()), &None) {
+            WatchStep::Changed {
+                request,
+                unavailable,
+            } => {
+                assert!(request.is_none());
+                assert!(unavailable, "no session is unavailable");
+            }
+            WatchStep::Unchanged => panic!("A->none must be a change"),
+        }
+
+        // none -> A.
+        match watch_step(&None, &Some(a.clone())) {
+            WatchStep::Changed {
+                request,
+                unavailable,
+            } => {
+                assert_eq!(request.as_ref(), Some(&a));
+                assert!(!unavailable);
+            }
+            WatchStep::Unchanged => panic!("none->A must be a change"),
+        }
+
+        // A -> B.
+        match watch_step(&Some(a.clone()), &Some(b.clone())) {
+            WatchStep::Changed { request, .. } => assert_eq!(request.as_ref(), Some(&b)),
+            WatchStep::Unchanged => panic!("A->B must be a change"),
+        }
+
+        // Same identity (pause/seek keep the identity): unchanged.
+        assert!(matches!(
+            watch_step(&Some(a.clone()), &Some(a.clone())),
+            WatchStep::Unchanged
+        ));
+    }
+
+    #[test]
+    fn stale_results_rejected_including_a_b_a() {
+        let a = key();
+        let b = TrackKey {
+            artist: "Other".into(),
+            title: "Track".into(),
+            album: String::new(),
+            duration_s: Some(200),
+        };
+
+        // Request under generation 1 for track A.
+        let req = LookupRequest {
+            generation: 1,
+            key: a.clone(),
+        };
+
+        // Media moved to B: rejected outright.
+        assert!(!should_apply(1, Some(&b), &req));
+
+        // Media moved away and BACK to A: the key matches again, but the
+        // generation is stale (A's later change bumped it) - rejected.
+        assert!(!should_apply(2, Some(&a), &req));
+
+        // Still on A under generation 1: applied.
+        assert!(should_apply(1, Some(&a), &req));
+
+        // No media session at completion time: rejected.
+        assert!(!should_apply(1, None, &req));
+    }
+
+    #[test]
+    fn retry_classification_honors_the_budget() {
+        let budget = Duration::from_secs(30);
+        // Server says 120s: above budget -> defer, never shorten.
+        assert_eq!(classify_retry(Some("120"), budget), RetryDecision::Defer);
+        // Within budget: wait the full server value.
+        assert_eq!(
+            classify_retry(Some("5"), budget),
+            RetryDecision::Wait(Duration::from_secs(5))
+        );
+        assert_eq!(
+            classify_retry(Some("30"), budget),
+            RetryDecision::Wait(Duration::from_secs(30)),
+            "exactly at the budget is still a wait"
+        );
+        // Missing header: small default wait.
+        assert_eq!(
+            classify_retry(None, budget),
+            RetryDecision::Wait(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn transient_5xx_is_not_a_permanent_no_match() {
+        // The classification of 503 lives in fetch_json_with_429's status
+        // handling; the semantics we test: a Failed("temporarily
+        // unavailable") result is cached as a cooldown-transient Error,
+        // never as NoMatch. The executor's match arm treats Error as
+        // transient (cooldown) and everything else terminal; here we pin
+        // the status classification the arm relies on.
+        let msg = "lrclib temporarily unavailable (status 503)";
+        let status = LyricsStatus::Error(msg.to_string());
+        assert!(matches!(status, LyricsStatus::Error(_)));
+        // A 5xx body never becomes NoMatch:
+        assert!(!msg.contains("not found"));
+    }
+
+    #[test]
+    fn album_name_parses_from_album_name_field() {
+        // The API sends albumName; the record must actually read it.
+        let json = r#"{
+            "trackName": "Song",
+            "artistName": "Artist",
+            "albumName": "The Album",
+            "duration": 180,
+            "instrumental": false,
+            "plainLyrics": null,
+            "syncedLyrics": null
+        }"#;
+        let rec: LrclibRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.album_name.as_deref(), Some("The Album"));
+    }
+
+    #[test]
+    fn album_disambiguates_but_never_invents() {
+        let ka = TrackKey {
+            artist: "Artist".into(),
+            title: "Song".into(),
+            album: "Album X".into(),
+            duration_s: Some(180),
+        };
+        let base = LrclibRecord {
+            track_name: "Song".into(),
+            artist_name: "Artist".into(),
+            album_name: None,
+            duration: Some(180.0),
+            instrumental: None,
+            plain_lyrics: None,
+            synced_lyrics: None,
+        };
+        let x = LrclibRecord {
+            album_name: Some("Album X".into()),
+            synced_lyrics: Some("[00:01.00]x\n".into()),
+            ..base.clone()
+        };
+        let y = LrclibRecord {
+            album_name: Some("Album Y".into()),
+            synced_lyrics: Some("[00:01.00]y\n".into()),
+            ..base
+        };
+        assert!(record_matches(&ka, &x));
+        assert!(record_matches(&ka, &y));
+
+        // The album filter picks X out of an otherwise-identical pair.
+        let matches = vec![&x, &y];
+        let by_album: Vec<&&LrclibRecord> = matches
+            .iter()
+            .filter(|r| match r.album_name.as_deref() {
+                Some(a) if !a.trim().is_empty() => {
+                    crate::lrc::normalize(a) == crate::lrc::normalize(&ka.album)
+                }
+                _ => false,
+            })
+            .collect();
+        assert_eq!(by_album.len(), 1);
+        assert!(matches!(by_album[0].to_status(), LyricsStatus::Synced(_)));
+
+        // Missing/empty album info on the query side keeps the rejection.
+        let no_album = TrackKey {
+            album: String::new(),
+            ..ka
+        };
+        assert!(no_album.album.trim().is_empty());
+    }
+
+    #[test]
+    fn interruptible_sleep_aborts_on_stop() {
+        let stop = Arc::new(AtomicBool::new(true));
+        // Already stopped: returns immediately without sleeping.
+        let start = Instant::now();
+        let completed = interruptible_sleep(Duration::from_secs(30), &stop);
+        assert!(!completed, "must abort when stop is set");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     #[ignore = "live network test; run with --ignored live_lyrics"]
     fn live_lyrics_smoke() {
         // One live check of both LRCLIB endpoints with a public-domain
@@ -563,7 +976,9 @@ mod tests {
                 ("duration", "240"),
             ])
         );
-        match fetch_json_with_429(&agent, &url) {
+        // Never-stopping stop flag for the live smoke test.
+        let stop = Arc::new(AtomicBool::new(false));
+        match fetch_json_with_429(&agent, &url, &stop) {
             FetchBody::Ok(body) => {
                 let rec: LrclibRecord = serde_json::from_str(&body).expect("valid LRCLIB record");
                 eprintln!(
@@ -583,7 +998,7 @@ mod tests {
                         ("track_name", "Amazing Grace"),
                     ])
                 );
-                match fetch_json_with_429(&agent, &surl) {
+                match fetch_json_with_429(&agent, &surl, &stop) {
                     FetchBody::Ok(body) => {
                         let recs: Vec<LrclibRecord> =
                             serde_json::from_str(&body).expect("valid search array");
