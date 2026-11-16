@@ -33,18 +33,10 @@ pub fn sample_at(vals: &[f32], t: f32) -> f32 {
 
 /// Reusable per-render scratch space: keeps the 60 fps render path free
 /// of per-frame allocations.
+#[derive(Default)]
 pub struct RenderScratch {
     bars: Vec<f32>,
     grid: Vec<u16>,
-}
-
-impl Default for RenderScratch {
-    fn default() -> Self {
-        Self {
-            bars: Vec::new(),
-            grid: Vec::new(),
-        }
-    }
 }
 
 impl RenderScratch {
