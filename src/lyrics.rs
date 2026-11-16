@@ -258,6 +258,10 @@ pub fn spawn_lyrics(
             // its deadline elapses (without an identity toggle), and
             // superseded instantly by any newer watcher request.
             let mut pending_retry: Option<(LookupRequest, Instant)> = None;
+            // Provider-wide rate-limit gate (Retry-After honored in full:
+            // a long 429 defers EVERY track, and the executor wakes at the
+            // gate deadline without blocking detection or quit).
+            let mut provider_gate = ProviderGate::new();
 
             while !stop.load(Ordering::Relaxed) {
                 // Wait for a request. When the current track is cooling
@@ -302,22 +306,32 @@ pub fn spawn_lyrics(
                         err
                     }
                     CooldownAction::Fetch => {
-                        let s = lookup_interruptible(&agent, &req.key, &stop);
-                        if let LyricsStatus::Error(_) = &s {
-                            // FRESH error: write the deadline once.
-                            cooldowns.insert(req.key.clone(), (s.clone(), now));
-                            if cooldowns.len() > CACHE_LIMIT {
-                                if let Some(oldest) = cooldowns
-                                    .iter()
-                                    .min_by_key(|(_, (_, at))| *at)
-                                    .map(|(k, _)| k.clone())
-                                {
-                                    cooldowns.remove(&oldest);
+                        // Provider-wide gate: a long Retry-After on ANY
+                        // track defers all fetches until it passes; the
+                        // request retries at the gate deadline (cached
+                        // tracks still serve instantly).
+                        if let Some(remaining) = provider_gate.remaining(now) {
+                            retry_at = Some(now + remaining);
+                            LyricsStatus::Error("lyrics rate-limited, waiting".into())
+                        } else {
+                            let s =
+                                lookup_interruptible(&agent, &req.key, &stop, &mut provider_gate);
+                            if let LyricsStatus::Error(_) = &s {
+                                // FRESH error: write the deadline once.
+                                cooldowns.insert(req.key.clone(), (s.clone(), now));
+                                if cooldowns.len() > CACHE_LIMIT {
+                                    if let Some(oldest) = cooldowns
+                                        .iter()
+                                        .min_by_key(|(_, (_, at))| *at)
+                                        .map(|(k, _)| k.clone())
+                                    {
+                                        cooldowns.remove(&oldest);
+                                    }
                                 }
+                                retry_at = Some(now + COOLDOWN);
                             }
-                            retry_at = Some(now + COOLDOWN);
+                            s
                         }
-                        s
                     }
                 };
 
@@ -477,6 +491,7 @@ fn lookup_interruptible(
     agent: &ureq::Agent,
     key: &TrackKey,
     stop: &Arc<AtomicBool>,
+    provider_gate: &mut ProviderGate,
 ) -> LyricsStatus {
     // Primary: /api/get with everything we know.
     let mut params: Vec<(&str, &str)> = vec![
@@ -491,7 +506,7 @@ fn lookup_interruptible(
         params.push(("duration", ds));
     }
     let url = format!("{BASE_URL}/api/get?{}", build_query(&params));
-    match fetch_record(agent, &url, stop) {
+    match fetch_record(agent, &url, stop, provider_gate) {
         FetchOutcome::Ok(rec) => {
             if record_matches(key, &rec) {
                 rec.to_status()
@@ -500,14 +515,19 @@ fn lookup_interruptible(
                 LyricsStatus::NoMatch
             }
         }
-        FetchOutcome::NotFound => search_fallback(agent, key, stop),
+        FetchOutcome::NotFound => search_fallback(agent, key, stop, provider_gate),
         FetchOutcome::RateLimited => LyricsStatus::Error("lyrics lookup rate limited".into()),
         FetchOutcome::Failed(e) => LyricsStatus::Error(e),
     }
 }
 
 /// On 404, search for candidates and pick a conservative match.
-fn search_fallback(agent: &ureq::Agent, key: &TrackKey, stop: &Arc<AtomicBool>) -> LyricsStatus {
+fn search_fallback(
+    agent: &ureq::Agent,
+    key: &TrackKey,
+    stop: &Arc<AtomicBool>,
+    provider_gate: &mut ProviderGate,
+) -> LyricsStatus {
     let url = format!(
         "{BASE_URL}/api/search?{}",
         build_query(&[
@@ -515,7 +535,7 @@ fn search_fallback(agent: &ureq::Agent, key: &TrackKey, stop: &Arc<AtomicBool>) 
             ("track_name", key.title.as_str()),
         ])
     );
-    match fetch_json_with_429(agent, &url, stop) {
+    match fetch_json_with_429(agent, &url, stop, provider_gate) {
         FetchBody::Ok(body) => {
             let records: Vec<LrclibRecord> = match serde_json::from_str(&body) {
                 Ok(r) => r,
@@ -569,8 +589,13 @@ enum FetchOutcome {
     Failed(String),
 }
 
-fn fetch_record(agent: &ureq::Agent, url: &str, stop: &Arc<AtomicBool>) -> FetchOutcome {
-    match fetch_json_with_429(agent, url, stop) {
+fn fetch_record(
+    agent: &ureq::Agent,
+    url: &str,
+    stop: &Arc<AtomicBool>,
+    provider_gate: &mut ProviderGate,
+) -> FetchOutcome {
+    match fetch_json_with_429(agent, url, stop, provider_gate) {
         FetchBody::Ok(body) => match serde_json::from_str::<LrclibRecord>(&body) {
             Ok(rec) => FetchOutcome::Ok(rec),
             Err(_) => FetchOutcome::Failed("lyrics response was malformed".into()),
@@ -578,6 +603,43 @@ fn fetch_record(agent: &ureq::Agent, url: &str, stop: &Arc<AtomicBool>) -> Fetch
         FetchBody::NotFound => FetchOutcome::NotFound,
         FetchBody::RateLimited => FetchOutcome::RateLimited,
         FetchBody::Failed(e) => FetchOutcome::Failed(e),
+    }
+}
+
+/// The provider-wide not-before deadline: when the server answers 429
+/// with a long Retry-After, EVERY track (not just the requesting one)
+/// waits until this instant passes. Clock-injectable for tests.
+#[derive(Debug)]
+pub struct ProviderGate {
+    not_before: Option<Instant>,
+}
+
+impl ProviderGate {
+    pub fn new() -> Self {
+        Self { not_before: None }
+    }
+
+    /// Defer all fetches for `d` from now (a later defer can only extend,
+    /// never shorten an existing server deadline).
+    pub fn defer_by(&mut self, d: Duration) {
+        let target = Instant::now() + d;
+        self.not_before = Some(match self.not_before {
+            Some(nb) if nb > target => nb,
+            _ => target,
+        });
+    }
+
+    /// Time remaining until fetches are allowed; None when open.
+    pub fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.not_before
+            .filter(|nb| *nb > now)
+            .map(|nb| nb.saturating_duration_since(now))
+    }
+}
+
+impl Default for ProviderGate {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -592,28 +654,99 @@ enum FetchBody {
 }
 
 /// Decision for a 429: honor the server's Retry-After when it is within
-/// our wait budget; above the budget, defer (the caller reports a
-/// transient error and a bounded cooldown handles recovery) instead of
-/// shortening the wait and retrying early. Pure and unit-testable.
+/// our in-fetch wait budget; above the budget, defer (the caller records a
+/// provider-wide deadline so EVERY track waits the full server value)
+/// instead of shortening the wait and retrying early.
 #[derive(Debug, PartialEq)]
 enum RetryDecision {
     /// Wait this long (plus jitter) and retry.
     Wait(Duration),
-    /// Deerral: stop retrying now, let the cooldown handle it.
-    Defer,
+    /// Defer: record the full server value as a provider-wide deadline.
+    Defer(Duration),
 }
 
-fn classify_retry(retry_after_header: Option<&str>, budget: Duration) -> RetryDecision {
-    let header_secs: Option<u64> = retry_after_header.and_then(|v| v.parse().ok());
-    match header_secs {
-        Some(s) => {
-            if Duration::from_secs(s) > budget {
-                RetryDecision::Defer
-            } else {
-                RetryDecision::Wait(Duration::from_secs(s))
-            }
-        }
-        None => RetryDecision::Wait(Duration::from_secs(2)), // no header: small default
+/// Parse a Retry-After header: either delay-seconds or an HTTP-date
+/// (IMF-fixdate, e.g. "Wed, 21 Oct 2026 07:28:00 GMT"). Returns the FULL
+/// requested wait; the caller decides whether to honor it in-fetch or
+/// defer. Missing/garbage -> None (small default elsewhere).
+fn parse_retry_after(header: Option<&str>, now: std::time::SystemTime) -> Option<Duration> {
+    let h = header?.trim();
+    // Delay-seconds.
+    if let Ok(secs) = h.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // HTTP-date: IMF-fixdate (the only form RFC 9110 allows).
+    parse_http_date(h).map(|target| {
+        target
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+            .max(Duration::ZERO)
+    })
+}
+
+/// Minimal IMF-fixdate parser: "Wed, 21 Oct 2026 07:28:00 GMT".
+/// Deliberately tiny: the format is fixed-width per RFC 9110 day-date.
+fn parse_http_date(s: &str) -> Option<std::time::SystemTime> {
+    use std::time::{Duration, UNIX_EPOCH};
+    // "Sun, 06 Nov 1994 08:49:37 GMT"
+    let bytes = s.as_bytes();
+    if bytes.len() != 29 {
+        return None;
+    }
+    // "Sun, 06 Nov 1994 08:49:37 GMT"
+    //  0123456789...          positions: 3=',' 4=' ' 7=' ' 11=' ' 16=' ' 19=':' 22=':' 25=' '
+    if bytes[3] != b','
+        || bytes[4] != b' '
+        || bytes[7] != b' '
+        || bytes[11] != b' '
+        || bytes[16] != b' '
+        || bytes[19] != b':'
+        || bytes[22] != b':'
+        || bytes[25] != b' '
+    {
+        return None;
+    }
+    let day: u32 = s.get(5..7)?.parse().ok()?;
+    let month = match s.get(8..11)? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = s.get(12..16)?.parse().ok()?;
+    let hour: u32 = s.get(17..19)?.parse().ok()?;
+    let min: u32 = s.get(20..22)?.parse().ok()?;
+    let sec: u32 = s.get(23..25)?.parse().ok()?;
+    // Days since epoch (civil-from-days algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = ((month + 9) % 12) as i64;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86_400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
+    if secs < 0 {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
+}
+
+fn classify_retry(parsed: Option<Duration>, budget: Duration) -> RetryDecision {
+    match parsed {
+        Some(d) if d > budget => RetryDecision::Defer(d),
+        Some(d) => RetryDecision::Wait(d),
+        // No parseable header: small default wait, never a long defer.
+        None => RetryDecision::Wait(Duration::from_secs(2)),
     }
 }
 
@@ -635,12 +768,18 @@ fn interruptible_sleep(d: Duration, stop: &Arc<AtomicBool>) -> bool {
 }
 
 /// GET with bounded body. 429s honor the server's Retry-After plus jitter
-/// when it is within the wait budget (sleep interruptible by `stop`, so a
-/// quit never hangs behind backoff); a Retry-After above the budget or an
-/// exhausted retry count defers instead of retrying early. 5xx are
-/// transient failures (the cooldown recovers them), 404 is NotFound,
-/// other 4xx are hard failures.
-fn fetch_json_with_429(agent: &ureq::Agent, url: &str, stop: &Arc<AtomicBool>) -> FetchBody {
+/// when it is within the in-fetch wait budget (sleep interruptible by
+/// `stop`, so a quit never hangs behind backoff); a Retry-After ABOVE the
+/// budget sets the PROVIDER-WIDE not-before deadline (`provider_gate`)
+/// to now + the full server value so every subsequent track defers too,
+/// then returns RateLimited. 5xx are transient failures (the cooldown
+/// recovers them), 404 is NotFound, other 4xx are hard failures.
+fn fetch_json_with_429(
+    agent: &ureq::Agent,
+    url: &str,
+    stop: &Arc<AtomicBool>,
+    provider_gate: &mut ProviderGate,
+) -> FetchBody {
     let mut attempt: u32 = 0;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -660,8 +799,14 @@ fn fetch_json_with_429(agent: &ureq::Agent, url: &str, stop: &Arc<AtomicBool>) -
                         return FetchBody::RateLimited;
                     }
                     let header = resp.header("Retry-After");
-                    match classify_retry(header, MAX_429_WAIT) {
-                        RetryDecision::Defer => return FetchBody::RateLimited,
+                    let parsed = parse_retry_after(header, std::time::SystemTime::now());
+                    match classify_retry(parsed, MAX_429_WAIT) {
+                        RetryDecision::Defer(full) => {
+                            // Provider-wide: EVERY track defers until the
+                            // full server value elapses (never shortened).
+                            provider_gate.defer_by(full);
+                            return FetchBody::RateLimited;
+                        }
                         RetryDecision::Wait(base) => {
                             attempt += 1;
                             // Jitter so bursts of clients don't retry in
@@ -1093,15 +1238,19 @@ mod tests {
     #[test]
     fn retry_classification_honors_the_budget() {
         let budget = Duration::from_secs(30);
-        // Server says 120s: above budget -> defer, never shorten.
-        assert_eq!(classify_retry(Some("120"), budget), RetryDecision::Defer);
+        // Server says 120s: above budget -> defer the FULL value, never
+        // shorten it to the budget.
+        assert_eq!(
+            classify_retry(Some(Duration::from_secs(120)), budget),
+            RetryDecision::Defer(Duration::from_secs(120))
+        );
         // Within budget: wait the full server value.
         assert_eq!(
-            classify_retry(Some("5"), budget),
+            classify_retry(Some(Duration::from_secs(5)), budget),
             RetryDecision::Wait(Duration::from_secs(5))
         );
         assert_eq!(
-            classify_retry(Some("30"), budget),
+            classify_retry(Some(Duration::from_secs(30)), budget),
             RetryDecision::Wait(Duration::from_secs(30)),
             "exactly at the budget is still a wait"
         );
@@ -1110,6 +1259,108 @@ mod tests {
             classify_retry(None, budget),
             RetryDecision::Wait(Duration::from_secs(2))
         );
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_http_dates() {
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // Delay-seconds.
+        assert_eq!(
+            parse_retry_after(Some("120"), now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(parse_retry_after(Some("0"), now), Some(Duration::ZERO));
+        // HTTP-date: now+120s -> exactly 120s remaining.
+        let target = now + Duration::from_secs(120);
+        let date = format_system_time(target);
+        assert_eq!(
+            parse_retry_after(Some(&date), now),
+            Some(Duration::from_secs(120)),
+            "HTTP-date must parse (got {date:?})"
+        );
+        // A date in the past: zero wait (not a negative panic).
+        let past = now - Duration::from_secs(10);
+        let date = format_system_time(past);
+        assert_eq!(parse_retry_after(Some(&date), now), Some(Duration::ZERO));
+        // Garbage: None (the caller defaults to a small wait).
+        assert_eq!(parse_retry_after(Some("soon-ish"), now), None);
+        assert_eq!(parse_retry_after(None, now), None);
+    }
+
+    #[test]
+    fn provider_gate_defers_all_tracks() {
+        // A long Retry-After defers EVERY track, not just the requester:
+        // the gate is provider-wide and the deadline is never shortened.
+        let mut gate = ProviderGate::new();
+        let now = Instant::now();
+        assert_eq!(gate.remaining(now), None, "gate starts open");
+
+        gate.defer_by(Duration::from_secs(120));
+        let rem = gate.remaining(now + Duration::from_secs(10)).unwrap();
+        assert!(
+            rem.as_secs() >= 109,
+            "120s defer leaves ~110s, got {}",
+            rem.as_secs()
+        );
+
+        // A different track requesting immediately: still deferred.
+        assert!(gate.remaining(now + Duration::from_secs(11)).is_some());
+
+        // A later, SHORTER defer cannot shorten the original deadline.
+        gate.defer_by(Duration::from_secs(30));
+        let rem = gate.remaining(now + Duration::from_secs(12)).unwrap();
+        assert!(
+            rem.as_secs() >= 107,
+            "short defer must not shorten, got {}",
+            rem.as_secs()
+        );
+
+        // And it opens after the deadline passes.
+        assert_eq!(gate.remaining(now + Duration::from_secs(130)), None);
+    }
+
+    #[test]
+    fn http_date_parser_round_trips_known_epoch() {
+        // Sun, 06 Nov 1994 08:49:37 GMT = 784111777.
+        let t = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        assert_eq!(
+            t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            784_111_777
+        );
+        // Wrong lengths/days/months are rejected.
+        assert!(parse_http_date("Sun, 06 Foo 1994 08:49:37 GMT").is_none());
+        assert!(parse_http_date("not a date").is_none());
+    }
+
+    /// Format a SystemTime as an IMF-fixdate for parse tests.
+    fn format_system_time(t: std::time::SystemTime) -> String {
+        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let days = secs / 86_400;
+        let rem = secs % 86_400;
+        let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        // Civil-from-days (Howard Hinnant's algorithm).
+        let z = days as i64 + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        let wd = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][((days % 7) + 4) as usize % 7]; // 1970-01-01 was a Thursday
+        let months = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        format!(
+            "{wd}, {:02} {} {y} {:02}:{:02}:{:02} GMT",
+            d,
+            months[(m - 1) as usize],
+            h,
+            mi,
+            s
+        )
     }
 
     #[test]
@@ -1219,9 +1470,10 @@ mod tests {
                 ("duration", "240"),
             ])
         );
-        // Never-stopping stop flag for the live smoke test.
+        // Never-stopping stop flag + fresh provider gate for the smoke test.
         let stop = Arc::new(AtomicBool::new(false));
-        match fetch_json_with_429(&agent, &url, &stop) {
+        let mut gate = ProviderGate::new();
+        match fetch_json_with_429(&agent, &url, &stop, &mut gate) {
             FetchBody::Ok(body) => {
                 let rec: LrclibRecord = serde_json::from_str(&body).expect("valid LRCLIB record");
                 eprintln!(
@@ -1241,7 +1493,7 @@ mod tests {
                         ("track_name", "Amazing Grace"),
                     ])
                 );
-                match fetch_json_with_429(&agent, &surl, &stop) {
+                match fetch_json_with_429(&agent, &surl, &stop, &mut gate) {
                     FetchBody::Ok(body) => {
                         let recs: Vec<LrclibRecord> =
                             serde_json::from_str(&body).expect("valid search array");
