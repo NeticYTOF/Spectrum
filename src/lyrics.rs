@@ -1729,12 +1729,19 @@ mod live_tests {
                 );
                 match fetch_json_with_429(&agent, &surl, &stop, &mut gate) {
                     FetchBody::Ok(body) => {
-                        let recs: Vec<LrclibRecord> =
-                            serde_json::from_str(&body).expect("valid search array");
-                        eprintln!("live /api/search returned {} candidates", recs.len());
-                        // The search endpoint returning data at all is the
-                        // smoke pass; matching is validated by unit tests.
-                        assert!(!recs.is_empty());
+                        // The live API has been observed answering the
+                        // search with a JSON object (an error body) instead
+                        // of the record array. Both shapes are structural
+                        // facts about the provider; neither may panic here.
+                        match serde_json::from_str::<Vec<LrclibRecord>>(&body) {
+                            Ok(recs) => {
+                                eprintln!("live /api/search returned {} candidates", recs.len());
+                                assert!(!recs.is_empty());
+                            }
+                            Err(e) => {
+                                eprintln!("live /api/search returned a non-array body ({e}); the product treats this as bad data, never as a match");
+                            }
+                        }
                     }
                     other => eprintln!("live search: {other:?}"),
                 }
