@@ -41,9 +41,10 @@ pub struct Layout {
 pub const LINE_PITCH: f32 = 1.8;
 /// Share of the band width a line may use.
 const WIDTH_FRAC: f32 = 0.88;
-/// Margin (design units) kept clear of garden plants at the top and
-/// bottom of the band, so nothing clips at a viewport edge.
-const VMARGIN: f32 = 2.0;
+/// Margin (design units) kept clear of garden content - letters AND
+/// plants - at the top and bottom of the band, so nothing clips at a
+/// viewport edge (1.5 terminal rows).
+const VMARGIN: f32 = 3.0;
 
 fn adv(c: char) -> f32 {
     font::advance(c).unwrap_or(0.5)
@@ -153,17 +154,19 @@ pub fn layout(text: &str, w: f32, h: f32) -> Layout {
         };
     }
     let max_w = w * WIDTH_FRAC;
-    // The garden's vertical extent for a candidate size: plants are capped
-    // by the viewport (botany::PlantCaps), so what must fit in the band -
-    // type, garden and breathing margins - is
-    //   (n-1)*LH*s + up(s) + down(s) <= h - 2*VMARGIN,
-    // with up(s) = min(1.76, 0.3 + caps/s) em and down likewise. The
-    // extent switches regimes at s* = caps_sum/1.46; the largest valid s
-    // is the uncapped solution while it stays under s*, else the capped
-    // regime's.
+    // What must fit in the band, with breathing margins at both edges, is
+    // the FULL vertical span: the letters' own ascender/descender plus the
+    // plants above and below (plants capped by the viewport; upstream's
+    // uncapped garden reaches ~1.76 em up / ~1.36 em down). The extent is
+    // monotonic in s, so the height bound is solved numerically - closed
+    // forms kept regressing (first plants-only, clipping ascenders).
     let caps = super::botany::PlantCaps::for_band(h);
     let caps_sum = caps.stem + caps.rose;
-    let s_switch = caps_sum / 1.46;
+    let span_px = |s: f32, n: f32| -> f32 {
+        let up = (m.ascender * s).max((0.3 * s + caps_sum).min(1.76 * s));
+        let down = (-m.descender * s).max((0.1 * s + caps_sum).min(1.36 * s));
+        up + down + (n - 1.0) * LINE_PITCH * s
+    };
     let size_for = |lines: &[Vec<usize>], words: &[Vec<char>]| -> f32 {
         let n = lines.len() as f32;
         let widest = lines
@@ -171,15 +174,20 @@ pub fn layout(text: &str, w: f32, h: f32) -> Layout {
             .map(|l| line_width(words, l))
             .fold(0.0f32, f32::max)
             .max(0.01);
-        let by_width = max_w / widest;
         let usable = (h - 2.0 * VMARGIN).max(1.0);
-        let s_u = usable / ((n - 1.0) * LINE_PITCH + 3.12);
-        let by_height = if s_u <= s_switch {
-            s_u
-        } else {
-            (usable - 2.0 * caps_sum).max(0.5) / ((n - 1.0) * LINE_PITCH + 0.49)
-        };
-        by_width.min(by_height).max(0.5)
+        let (mut lo, mut hi) = (0.5f32, (usable / 0.49).max(1.0));
+        if span_px(hi, n) <= usable {
+            return (max_w / widest).min(hi);
+        }
+        for _ in 0..48 {
+            let mid = 0.5 * (lo + hi);
+            if span_px(mid, n) <= usable {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (max_w / widest).min(lo).max(0.5)
     };
 
     let search = |words: &[Vec<char>]| {
@@ -212,9 +220,9 @@ pub fn layout(text: &str, w: f32, h: f32) -> Layout {
     let (s, lines) = chosen;
 
     let n = lines.len();
-    // Center the full garden span (plants above the first baseline,
-    // descenders and down-plants below the last) with the breathing
-    // margins - guaranteed inside the band by the size solve above.
+    // Center the full content span - ascenders and up-plants above the
+    // first baseline, descenders and down-plants below the last - with
+    // the breathing margins; the size solve above guarantees it fits.
     let (up_em, down_em) = caps.extent_em(s);
     let span = up_em * s + (n as f32 - 1.0) * LINE_PITCH * s + down_em * s;
     let slack = (h - span - 2.0 * VMARGIN).max(0.0);

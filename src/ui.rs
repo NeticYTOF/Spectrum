@@ -1418,23 +1418,86 @@ mod tests {
         })
     }
 
+    /// The exact `--demo --mode 6 --demo-lyric hello --freeze-at 4.5` path.
+    fn snap_mode6_frozen(lyric: Option<&str>, w: u16, h: u16) -> Buffer {
+        snapshot(&Snapshot {
+            mode: 6,
+            theme: "spectrum",
+            depth: ColorDepth::True,
+            at: 4.5,
+            frozen: true,
+            warmup: 0.0,
+            lyric,
+            width: w,
+            height: h,
+        })
+    }
+
     #[test]
     fn garden_keeps_breathing_room_at_the_edges() {
         // Regression: plants used to tower past the band and clip at the
-        // viewport top. The garden must leave the first and last rows of
-        // the band clear of plants for both a short word and the full
-        // lyric fixture, at the reviewer's sizes.
+        // viewport top, and a plant-only fit calculation pressed h/l
+        // ASCENDERS against the top edge (plants fit but the letters did
+        // not). Both the ink (letters) and the plants must stay clear of
+        // the first and last rows of the band.
+        for (w, h) in [(144u16, 42u16), (72, 22)] {
+            for frozen in [false, true] {
+                for lyric in [Some("hello"), None] {
+                    let buf = if frozen {
+                        snap_mode6_frozen(lyric, w, h)
+                    } else {
+                        snap_mode6(lyric, w, h)
+                    };
+                    let (letter_rows, plant_rows) = garden_rows(&buf, w, h);
+                    for (name, rows) in [("letters", &letter_rows), ("plants", &plant_rows)] {
+                        if let (Some(&top), Some(&bot)) = (rows.first(), rows.last()) {
+                            assert!(
+                                top >= 3,
+                                "{w}x{h} {name} at row {top} (frozen={frozen}, clipped top)"
+                            );
+                            assert!(
+                                bot <= h - 3,
+                                "{w}x{h} {name} at row {bot} of {h} (frozen={frozen}, clipped bottom)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_hello_keeps_ascenders_off_the_top_edge() {
+        // The exact reported path: --demo-lyric hello --freeze-at 4.5.
+        // "hello" has tall h/l ascenders; the fit must reserve the full
+        // glyph bounds, so the first ink row stays clear of the band top.
+        // The single-line custom lyric has no prev row, so the band starts
+        // at row 1: the ascenders must keep at least two rows below it.
+        for (w, h) in [(144u16, 42u16), (72, 22)] {
+            let buf = snap_mode6_frozen(Some("hello"), w, h);
+            let (letter_rows, _) = garden_rows(&buf, w, h);
+            let top = letter_rows.first().copied().unwrap_or(0);
+            assert!(
+                top >= 3,
+                "{w}x{h}: ascenders pressed at row {top} (band starts at 1)"
+            );
+            // The word also must not sit in the bottom quarter.
+            let bot = letter_rows.last().copied().unwrap_or(0);
+            assert!(bot <= h - 3, "{w}x{h}: letters touch the bottom at {bot}");
+        }
+    }
+
+    #[test]
+    fn frozen_and_live_lay_out_the_same_type() {
+        // Layout is a pure function of text and size: the frozen CLI path
+        // and a live render at the same demo time must place the type in
+        // the SAME rows (only bloom/sway detail may differ).
         for (w, h) in [(144u16, 42u16), (72, 22)] {
             for lyric in [Some("hello"), None] {
-                let buf = snap_mode6(lyric, w, h);
-                let (_, plant_rows) = garden_rows(&buf, w, h);
-                if let (Some(&top), Some(&bot)) = (plant_rows.first(), plant_rows.last()) {
-                    assert!(top >= 3, "{w}x{h} plants at row {top} (clipped top)");
-                    assert!(
-                        bot <= h - 3,
-                        "{w}x{h} plants at row {bot} of {h} (clipped bottom)"
-                    );
-                }
+                let (a, b) = (snap_mode6_frozen(lyric, w, h), snap_mode6(lyric, w, h));
+                let (la, _) = garden_rows(&a, w, h);
+                let (lb, _) = garden_rows(&b, w, h);
+                assert_eq!(la, lb, "{w}x{h} frozen/live letter rows differ ({lyric:?})");
             }
         }
     }

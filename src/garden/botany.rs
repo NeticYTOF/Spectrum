@@ -43,14 +43,19 @@ impl PlantCaps {
         }
     }
 
-    /// The garden's vertical extent in em for type size `s`: stems sprout
-    /// up to ~0.3 em inside the letters and grow at most `stem` design
-    /// units with a rose at the tip (upstream's uncapped garden reaches
-    /// ~1.76 em above the baseline, ~1.36 em below).
+    /// The garden's vertical extent in em for type size `s`, INCLUDING THE
+    /// LETTERS THEMSELVES: upstream's demo keeps ascenders/descenders plus
+    /// plants clear of the frame. Stems sprout up to ~0.3 em inside the
+    /// letters and grow at most `stem` design units with a rose at the tip
+    /// (upstream's uncapped garden reaches ~1.76 em above the baseline,
+    /// ~1.36 em below); the type's ascender/descender are the floor of the
+    /// extent - a word like "hello" presses its h/l ascenders to the top
+    /// edge if only plants are reserved.
     pub fn extent_em(&self, s: f32) -> (f32, f32) {
+        let m = super::font::metrics();
         let reach = (self.stem + self.rose) / s;
-        let up = (0.3 + reach).min(1.76);
-        let down = (0.19 + reach).min(1.36);
+        let up = m.ascender.max(0.3 + reach).min(1.76);
+        let down = (-m.descender).max(0.1 + reach).min(1.36);
         (up, down)
     }
 }
