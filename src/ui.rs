@@ -584,7 +584,7 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, width: u16) -> Lin
     ));
 
     let wide = Span::styled(
-        "1-5 modes \u{b7} space pause \u{b7} t theme \u{b7} h help \u{b7} q quit",
+        "1-6 modes \u{b7} space pause \u{b7} t theme \u{b7} h help \u{b7} q quit",
         Style::new().fg(dim),
     );
 
@@ -825,7 +825,7 @@ mod tests {
         let text = span_text(&wide);
         assert!(text.contains("demo"), "chip missing: {text}");
         assert!(text.contains("synthetic"), "source missing: {text}");
-        assert!(text.contains("1-5 modes"), "wide hints missing: {text}");
+        assert!(text.contains("1-6 modes"), "wide hints missing: {text}");
         assert!(!text.contains("h help \u{b7} q quit h"), "dup: {text}");
         assert_eq!(text.matches("DEMO").count(), 0, "duplicated DEMO: {text}");
 
@@ -849,7 +849,7 @@ mod tests {
             "short hints or ellipsis expected: {ntext}"
         );
         assert!(
-            !ntext.contains("1-5 modes"),
+            !ntext.contains("1-6 modes"),
             "wide hints must drop: {ntext}"
         );
     }
