@@ -803,12 +803,20 @@ fn fetch_json_with_429(
                     return FetchBody::NotFound;
                 }
                 if code == 429 {
-                    if attempt >= MAX_429_RETRIES {
-                        return FetchBody::RateLimited;
-                    }
                     let header = resp.header("Retry-After");
                     let parsed = parse_retry_after(header, std::time::SystemTime::now());
-                    match classify_retry(parsed, MAX_429_WAIT) {
+                    let decision = classify_retry(parsed, MAX_429_WAIT);
+                    if attempt >= MAX_429_RETRIES {
+                        // Final attempt: still honor the server's deadline
+                        // provider-wide before giving up, so the next
+                        // track does not hammer immediately.
+                        let hold = match decision {
+                            RetryDecision::Defer(d) | RetryDecision::Wait(d) => d,
+                        };
+                        provider_gate.defer_by(hold);
+                        return FetchBody::RateLimited;
+                    }
+                    match decision {
                         RetryDecision::Defer(full) => {
                             // Provider-wide: EVERY track defers until the
                             // full server value elapses (never shortened).
@@ -1520,6 +1528,30 @@ mod tests {
 
     const NOT_FOUND: &str =
         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    #[test]
+    #[ignore = "networking on localhost; run with --ignored mock_worker"]
+    fn mock_final_429_still_sets_provider_gate() {
+        // Regression: the LAST 429 returned before its Retry-After was
+        // parsed, so the gate stayed open and the next track hammered.
+        let r429 = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 25\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string();
+        // Retry-After 25 is within the wait budget, so two waits occur
+        // before the final attempt (interrupted by the stop flag below
+        // would hide the bug, so use a short value instead).
+        let short = r429.replace("25", "1");
+        let server = MockServer::spawn(vec![short.clone(), short.clone(), short]);
+        let agent = build_agent();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut gate = ProviderGate::new();
+        let body = fetch_json_with_429(&agent, &format!("{}/x", server.url()), &stop, &mut gate);
+        assert!(matches!(body, FetchBody::RateLimited));
+        let rem = gate.remaining(Instant::now());
+        assert!(
+            rem.is_some_and(|d| d > Duration::from_millis(300)),
+            "final 429 must hold the gate, got {rem:?}"
+        );
+    }
 
     /// Serializes env-mutating tests (SPECTRUM_LRCLIB_BASE is process-global).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
