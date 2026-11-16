@@ -22,10 +22,17 @@ pub fn new_queue() -> SampleQueue {
 ///
 /// Locks are short and never panic: a poisoned lock is recovered from
 /// instead of taking down the audio callback.
-pub fn push_sample(queue: &SampleQueue, sample: f32) {
+pub fn push_samples(queue: &SampleQueue, samples: &[f32]) {
+    if samples.is_empty() {
+        return;
+    }
     let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-    q.push_back(sample);
-    if q.len() > QUEUE_CAP {
+    for &s in samples {
+        if s.is_finite() {
+            q.push_back(s);
+        }
+    }
+    while q.len() > QUEUE_CAP {
         q.pop_front();
     }
 }
@@ -85,12 +92,19 @@ impl AudioHandle {
 /// Wraps a rodio source and taps the samples actually pulled by the
 /// playback engine, mixing them down to mono for the analyzer. This
 /// guarantees the visuals are exactly in sync with what is audible.
+///
+/// Tapped samples are batched and flushed to the queue in bulk so the
+/// audio thread takes the queue lock ~170 times per second instead of
+/// once per sample (~44,000).
+const TEE_BATCH: usize = 512;
+
 pub struct TeeSource<S> {
     source: S,
     queue: SampleQueue,
     channels: u16,
     acc: f32,
     count: u16,
+    batch: Vec<f32>,
 }
 
 impl<S> TeeSource<S> {
@@ -101,6 +115,15 @@ impl<S> TeeSource<S> {
             channels: channels.max(1),
             acc: 0.0,
             count: 0,
+            batch: Vec::with_capacity(TEE_BATCH),
+        }
+    }
+
+    /// Bulk-push the pending batch under a single lock acquisition.
+    fn flush(&mut self) {
+        if !self.batch.is_empty() {
+            push_samples(&self.queue, &self.batch);
+            self.batch.clear();
         }
     }
 }
@@ -144,20 +167,35 @@ where
     type Item = S::Item;
 
     fn next(&mut self) -> Option<S::Item> {
-        let sample = self.source.next()?;
+        let sample = match self.source.next() {
+            Some(s) => s,
+            None => {
+                self.flush(); // don't strand the tail of the stream
+                return None;
+            }
+        };
         let v = sample.to_f32();
         if self.channels <= 1 {
-            push_sample(&self.queue, v);
+            self.batch.push(v);
         } else {
             self.acc += v;
             self.count += 1;
             if self.count >= self.channels {
-                push_sample(&self.queue, self.acc / self.channels as f32);
+                self.batch.push(self.acc / self.channels as f32);
                 self.acc = 0.0;
                 self.count = 0;
             }
         }
+        if self.batch.len() >= TEE_BATCH {
+            self.flush();
+        }
         Some(sample)
+    }
+}
+
+impl<S> Drop for TeeSource<S> {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -281,25 +319,30 @@ where
     T: cpal::SizedSample + AsF32,
 {
     let channels = channels.max(1);
+    let mut batch: Vec<f32> = Vec::with_capacity(2048);
+    let mut acc = 0.0f32;
+    let mut count = 0u16;
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _info| {
-            let mut acc = 0.0f32;
-            let mut count = 0u16;
+            // Mix the whole callback buffer down to mono first, then hand
+            // it to the queue in one bulk push (one lock per callback).
+            batch.clear();
             for sample in data {
                 let v = (*sample).as_f32();
                 if channels <= 1 {
-                    push_sample(&queue, v);
+                    batch.push(v);
                 } else {
                     acc += v;
                     count += 1;
                     if count >= channels {
-                        push_sample(&queue, acc / channels as f32);
+                        batch.push(acc / channels as f32);
                         acc = 0.0;
                         count = 0;
                     }
                 }
             }
+            push_samples(&queue, &batch);
         },
         |_err| {
             // Capture glitches are non-fatal; the analyzer just sees
@@ -381,4 +424,116 @@ pub fn start_capture(queue: SampleQueue) -> Result<AudioHandle> {
     }
 
     bail!("failed to start audio capture.\n{}", attempts.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal f32 source yielding 1.0, 2.0, 3.0, ...
+    struct RampSource {
+        len: usize,
+        pos: usize,
+        channels: u16,
+        rate: u32,
+    }
+
+    impl Iterator for RampSource {
+        type Item = f32;
+
+        fn next(&mut self) -> Option<f32> {
+            if self.pos >= self.len {
+                return None;
+            }
+            self.pos += 1;
+            Some(self.pos as f32)
+        }
+    }
+
+    impl Source for RampSource {
+        fn current_frame_len(&self) -> Option<usize> {
+            Some(self.len - self.pos)
+        }
+        fn channels(&self) -> u16 {
+            self.channels
+        }
+        fn sample_rate(&self) -> u32 {
+            self.rate
+        }
+        fn total_duration(&self) -> Option<std::time::Duration> {
+            None
+        }
+    }
+
+    fn drain_queue(queue: &SampleQueue) -> Vec<f32> {
+        queue.lock().unwrap().drain(..).collect()
+    }
+
+    #[test]
+    fn tee_mixes_stereo_and_flushes_tail() {
+        let queue = new_queue();
+        // 6 samples = 3 stereo frames: (1,2) (3,4) (5,6) -> mono 1.5, 3.5, 5.5
+        let src = RampSource {
+            len: 6,
+            pos: 0,
+            channels: 2,
+            rate: 44_100,
+        };
+        let mut tee = TeeSource::new(src, 2, queue.clone());
+
+        let mut out = 0;
+        while tee.next().is_some() {
+            out += 1;
+        }
+        assert_eq!(out, 6);
+
+        let drained = drain_queue(&queue);
+        let expect = [1.5, 3.5, 5.5];
+        assert_eq!(drained.len(), expect.len(), "tail must flush on end");
+        for (a, b) in drained.iter().zip(expect.iter()) {
+            assert!((a - b).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn tee_batches_midstream_without_loss() {
+        let queue = new_queue();
+        // 1500 mono samples: forces a flush at TEE_BATCH (512) mid-stream
+        let src = RampSource {
+            len: 1500,
+            pos: 0,
+            channels: 1,
+            rate: 44_100,
+        };
+        let mut tee = TeeSource::new(src, 1, queue.clone());
+        for _ in 0..1000 {
+            tee.next();
+        }
+        // Exactly one full batch should have been flushed so far.
+        let partial = drain_queue(&queue);
+        assert_eq!(partial.len(), TEE_BATCH);
+
+        while tee.next().is_some() {}
+        let rest = drain_queue(&queue);
+        assert_eq!(partial.len() + rest.len(), 1500, "no sample may be lost");
+    }
+
+    #[test]
+    fn queue_overflow_drops_oldest() {
+        let queue = new_queue();
+        let big: Vec<f32> = (0..QUEUE_CAP + 100).map(|i| i as f32).collect();
+        push_samples(&queue, &big);
+        let drained = drain_queue(&queue);
+        assert_eq!(drained.len(), QUEUE_CAP);
+        // Oldest samples dropped, newest retained in order.
+        assert_eq!(drained[0], 100.0);
+        assert_eq!(drained[QUEUE_CAP - 1], (QUEUE_CAP + 99) as f32);
+    }
+
+    #[test]
+    fn non_finite_samples_never_enter_queue() {
+        let queue = new_queue();
+        push_samples(&queue, &[f32::NAN, f32::INFINITY, 0.5]);
+        assert_eq!(drain_queue(&queue), vec![0.5]);
+    }
 }
