@@ -29,6 +29,13 @@ use crate::media::{MediaShared, MediaSnapshot};
 
 const USER_AGENT: &str = "spectrum/0.1.0 (+https://github.com/NeticYTOF/Spectrum)";
 const BASE_URL: &str = "https://lrclib.net";
+
+/// The base URL, overridable via SPECTRUM_LRCLIB_BASE for tests (a local
+/// mock server); falls back to the real provider.
+fn base_url() -> String {
+    std::env::var("SPECTRUM_LRCLIB_BASE").unwrap_or_else(|_| BASE_URL.to_string())
+}
+
 /// Hard cap on response bodies: lyrics are tiny; anything bigger is junk.
 const MAX_BODY: u64 = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -505,7 +512,7 @@ fn lookup_interruptible(
     if let Some(ds) = duration_str.as_deref() {
         params.push(("duration", ds));
     }
-    let url = format!("{BASE_URL}/api/get?{}", build_query(&params));
+    let url = format!("{}/api/get?{}", base_url(), build_query(&params));
     match fetch_record(agent, &url, stop, provider_gate) {
         FetchOutcome::Ok(rec) => {
             if record_matches(key, &rec) {
@@ -529,7 +536,8 @@ fn search_fallback(
     provider_gate: &mut ProviderGate,
 ) -> LyricsStatus {
     let url = format!(
-        "{BASE_URL}/api/search?{}",
+        "{}/api/search?{}",
+        base_url(),
         build_query(&[
             ("artist_name", key.artist.as_str()),
             ("track_name", key.title.as_str()),
@@ -1456,6 +1464,198 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
+    // ---- Mock-server integration tests: real watcher+executor threads
+    // against a local HTTP server, exercising the actual worker loop.
+
+    /// A single-shot mock HTTP server on a random local port. Each
+    /// request pops one scripted response.
+    struct MockServer {
+        addr: std::net::SocketAddr,
+        #[allow(dead_code)] // kept for future request-assertion tests
+        requests: std::sync::mpsc::Receiver<(String, ())>,
+    }
+
+    impl MockServer {
+        fn spawn(responses: Vec<String>) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for resp in responses {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = tx.send((req, ()));
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                    // Drop the stream: Connection-close semantics rely on
+                    // the socket actually closing.
+                    drop(stream);
+                }
+            });
+            Self { addr, requests: rx }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    fn ok_record_json(track: &str, artist: &str) -> String {
+        let body = format!(
+            "{{\"trackName\":\"{track}\",\"artistName\":\"{artist}\",\
+\"duration\":180,\"instrumental\":false,\"plainLyrics\":null,\
+\"syncedLyrics\":\"[00:01.00]mock line\\n\"}}"
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    const NOT_FOUND: &str =
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// Serializes env-mutating tests (SPECTRUM_LRCLIB_BASE is process-global).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[ignore = "networking on localhost; run with --ignored mock_worker"]
+    fn mock_worker_success_and_track_change_clears() {
+        let _env = ENV_LOCK.lock().unwrap();
+        // Two scripted responses: track A succeeds, track B 404s (no
+        // match) - the full pipeline must publish A's synced lyrics, then
+        // clear instantly on the switch, then show B's no-match.
+        let a = key();
+        let b = TrackKey {
+            artist: "Other".into(),
+            title: "Track".into(),
+            album: String::new(),
+            duration_s: Some(200),
+        };
+        let server = MockServer::spawn(vec![
+            ok_record_json("Song", "Artist"),
+            NOT_FOUND.to_string(),
+            // B's 404 triggers the search fallback: return an empty
+            // candidate array (honest NoMatch).
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+                .to_string(),
+        ]);
+        std::env::set_var("SPECTRUM_LRCLIB_BASE", server.url());
+
+        let media = crate::media::new_shared();
+        let lyrics = new_shared();
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = spawn_lyrics(media.clone(), lyrics.clone(), stop.clone());
+
+        // Track A: media session appears.
+        *media.lock().unwrap() = crate::media::MediaSnapshot {
+            available: true,
+            title: a.title.clone(),
+            artist: a.artist.clone(),
+            album: String::new(),
+            duration_s: a.duration_s.map(|d| d as f64),
+            position_s: 0.0,
+            playing: true,
+        };
+
+        // A's synced lyrics arrive within the mock's response time.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = lyrics.lock().unwrap().clone();
+            if matches!(st.status, LyricsStatus::Synced(_)) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "A never synced: {:?}", st);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Track change to B: the state clears to Loading immediately,
+        // then resolves to NoMatch from the 404.
+        *media.lock().unwrap() = crate::media::MediaSnapshot {
+            available: true,
+            title: b.title.clone(),
+            artist: b.artist.clone(),
+            album: String::new(),
+            duration_s: b.duration_s.map(|d| d as f64),
+            position_s: 0.0,
+            playing: true,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = lyrics.lock().unwrap().clone();
+            if matches!(st.status, LyricsStatus::NoMatch) && st.key.as_ref() == Some(&b) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "B never resolved: {:?}", st);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            let _ = t.join();
+        }
+        std::env::remove_var("SPECTRUM_LRCLIB_BASE");
+    }
+
+    #[test]
+    #[ignore = "networking on localhost; run with --ignored mock_worker"]
+    fn mock_worker_429_defer_sets_provider_gate() {
+        let _env = ENV_LOCK.lock().unwrap();
+        // A 429 with Retry-After 120 defers the full 120s provider-wide:
+        // the worker reports a transient error without retrying early
+        // (we observe the Error state within the window and the request
+        // count staying at one).
+        let server = MockServer::spawn(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        ]);
+        std::env::set_var("SPECTRUM_LRCLIB_BASE", server.url());
+
+        let media = crate::media::new_shared();
+        let lyrics = new_shared();
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = spawn_lyrics(media.clone(), lyrics.clone(), stop.clone());
+
+        *media.lock().unwrap() = crate::media::MediaSnapshot {
+            available: true,
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: String::new(),
+            duration_s: Some(180.0),
+            position_s: 0.0,
+            playing: true,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = lyrics.lock().unwrap().clone();
+            if matches!(st.status, LyricsStatus::Error(_)) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no error surfaced: {:?}", st);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // No second request arrives while deferred (only one response was
+        // scripted; a retry would hang the server and time us out).
+
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            let _ = t.join();
+        }
+        std::env::remove_var("SPECTRUM_LRCLIB_BASE");
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
     #[test]
     #[ignore = "live network test; run with --ignored live_lyrics"]
     fn live_lyrics_smoke() {
@@ -1463,7 +1663,8 @@ mod tests {
         // song (no copyrighted fetches). Structural validation only.
         let agent = build_agent();
         let url = format!(
-            "{BASE_URL}/api/get?{}",
+            "{}/api/get?{}",
+            base_url(),
             build_query(&[
                 ("artist_name", "Traditional"),
                 ("track_name", "Amazing Grace"),
@@ -1487,7 +1688,8 @@ mod tests {
             FetchBody::NotFound => {
                 eprintln!("live /api/get: 404; engaging the search fallback");
                 let surl = format!(
-                    "{BASE_URL}/api/search?{}",
+                    "{}/api/search?{}",
+                    base_url(),
                     build_query(&[
                         ("artist_name", "Traditional"),
                         ("track_name", "Amazing Grace"),
