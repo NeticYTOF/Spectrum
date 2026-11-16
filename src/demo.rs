@@ -44,13 +44,15 @@ fn section_energy(t: f32) -> f32 {
 }
 
 /// Band profile: bass bump that tracks the kick, two melodic bumps that
-/// wander across the mid range, and a faint sparkle tail.
+/// wander across the mid range, and a faint sparkle tail. The whole
+/// profile - kick included - follows the section energy so the silence
+/// phase is genuinely silent.
 fn band_value(band_t: f32, t: f32, energy: f32, t_since_beat: f32) -> f32 {
     let bass = kick(t_since_beat) * (-band_t * 3.5).exp();
     let mel1 = 0.55 * (-((band_t - (0.35 + 0.12 * (t * 0.9).sin())) * 9.0).powi(2)).exp();
     let mel2 = 0.4 * (-((band_t - (0.65 + 0.10 * (t * 0.6).cos())) * 11.0).powi(2)).exp();
     let sparkle = 0.12 * (-((band_t - 0.92) * 6.0).powi(2)).exp() * (t * 7.0).sin().abs();
-    let v = bass * 0.9 + (mel1 + mel2 + sparkle) * energy;
+    let v = (bass * 0.9 + mel1 + mel2 + sparkle) * energy;
     v.clamp(0.0, 1.0)
 }
 
@@ -63,7 +65,9 @@ fn synth_waveform(energy: f32, t_since_beat: f32) -> Vec<f32> {
     let mut v = Vec::with_capacity(len);
     for i in 0..len {
         let tt = i as f32 / rate;
-        let kick_env = kick(t_since_beat) * kick(tt * 2.0);
+        // The kick follows the section energy too: the silence phase
+        // produces a flat line, not a pulsing bass.
+        let kick_env = kick(t_since_beat) * kick(tt * 2.0) * energy;
         let kick = (2.0 * PI * 55.0 * tt).sin() * kick_env * 0.8;
         let tone = (2.0 * PI * 220.0 * tt).sin() * 0.25 * energy;
         let air = (2.0 * PI * 880.0 * tt).sin() * 0.06 * energy;

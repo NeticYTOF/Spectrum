@@ -340,11 +340,11 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
     let beat_color = app.themes[theme_idx].beat();
     let border = theme::lerp_color(accent, beat_color, beat_flash);
 
-    let status = status_line(app, audio, accent, analysis.flux);
-
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
     let main = chunks[0];
     let status_area = chunks[1];
+
+    let status = status_line(app, audio, accent, status_area.width);
 
     let mut title_right = vec![
         Span::raw(" "),
@@ -366,11 +366,16 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
         ));
     }
 
+    let title_width = 4 + mode.name().chars().count() + if audio.demo { 6 } else { 0 };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(border))
         .title(Line::from(title_left))
-        .title(Line::from(title_right).right_aligned());
+        .title(if area.width as usize > title_width + 12 {
+            Line::from(title_right).right_aligned()
+        } else {
+            Line::from("")
+        });
     let inner = block.inner(main);
     f.render_widget(block, main);
 
@@ -403,11 +408,14 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
                 scratch,
                 dt,
             );
-            // Waveform overlaid on a centered band of the bar field.
-            let wave_h = (inner.height / 2).clamp(2, inner.height);
+            // Waveform overlaid on the upper-middle band of the bar field:
+            // bars live near the bottom, so this fills the space they
+            // rarely reach and keeps the trace clearly separated.
+            let wave_h = (inner.height * 2 / 5).clamp(2, inner.height.saturating_sub(1).max(2));
+            let wave_top = inner.height / 6;
             let wave = Rect::new(
                 inner.x,
-                inner.y + (inner.height - wave_h) / 2,
+                inner.y + wave_top.min(inner.height.saturating_sub(wave_h)),
                 inner.width,
                 wave_h,
             );
@@ -416,7 +424,7 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
                 wave,
                 &analysis.waveform,
                 theme,
-                0.9,
+                1.1,
                 scratch,
             );
         }
@@ -451,10 +459,18 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
     }
 }
 
-fn status_line(app: &App, audio: &AudioHandle, accent: Color, flux: f32) -> Line<'static> {
+/// Build the status bar for a given width. Sections are ordered by
+/// priority; lower-priority ones are dropped whole (never truncated
+/// mid-string, so no broken glyphs) when the width can't fit everything.
+fn status_line(app: &App, audio: &AudioHandle, accent: Color, width: u16) -> Line<'static> {
     let dim = Color::Rgb(130, 130, 130);
     let meta = audio.meta_snapshot();
-    let state = if audio.demo {
+
+    // The chip is the single honest state; the DEMO banner lives in the
+    // window title, so it is not repeated here.
+    let state = if meta.status == "reconnecting" || meta.status == "degraded" {
+        meta.status
+    } else if audio.demo {
         if app.paused {
             "paused"
         } else {
@@ -479,52 +495,81 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, flux: f32) -> Line
         _ => "\u{b7}",
     };
 
-    let mut spans = vec![
-        Span::styled(
-            format!(" {icon} {state} "),
-            Style::new().fg(accent).add_modifier(Modifier::BOLD),
+    let warned = meta.status == "reconnecting" || meta.status == "degraded";
+
+    // (span, priority): smaller priority = kept when narrow.
+    let mut sections: Vec<(Span<'static>, u8)> = vec![
+        (
+            Span::styled(
+                format!("{icon} {state} "),
+                Style::new().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            0,
         ),
-        Span::styled(
-            format!("{} ", meta.description),
-            Style::new().fg(if meta.status == "reconnecting" {
-                Color::Yellow
-            } else {
-                Color::White
-            }),
+        (
+            Span::styled(
+                format!("{} ", meta.description),
+                Style::new().fg(if warned { Color::Yellow } else { Color::White }),
+            ),
+            1,
         ),
     ];
-    if audio.demo {
-        spans.push(Span::styled(
-            "DEMO \u{b7} silent synthetic ",
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ));
-    }
     if !audio.is_live() && !audio.demo {
-        spans.push(Span::styled(
-            format!("vol {:>3.0}% ", app.volume * 100.0),
-            Style::new().fg(dim),
+        sections.push((
+            Span::styled(
+                format!("vol {:>3.0}% ", app.volume * 100.0),
+                Style::new().fg(dim),
+            ),
+            2,
         ));
     }
-    spans.push(Span::styled(
-        format!("sens {:.1} ", app.sensitivity),
-        Style::new().fg(dim),
+    sections.push((
+        Span::styled(
+            format!("[{}:{}] ", app.theme().name, app.depth.name()),
+            Style::new().fg(accent),
+        ),
+        3,
     ));
-    spans.push(Span::styled(
-        format!("smooth {:.2} ", app.fall),
-        Style::new().fg(dim),
+    sections.push((
+        Span::styled(
+            format!("sens {:.1} \u{b7} smooth {:.2} ", app.sensitivity, app.fall),
+            Style::new().fg(dim),
+        ),
+        4,
     ));
-    spans.push(Span::styled(
-        format!("flux {:.2} ", flux),
-        Style::new().fg(dim),
+    sections.push((
+        Span::styled(
+            "1-5 modes \u{b7} space pause \u{b7} t theme \u{b7} h help \u{b7} q quit",
+            Style::new().fg(dim),
+        ),
+        5,
     ));
-    spans.push(Span::styled(
-        format!("[{}:{}] ", app.theme().name, app.depth.name()),
-        Style::new().fg(accent),
+    sections.push((
+        Span::styled("h help \u{b7} q quit", Style::new().fg(dim)),
+        6,
     ));
-    spans.push(Span::styled(
-        "1-5 modes \u{b7} space pause \u{b7} t theme \u{b7} h help \u{b7} q quit",
-        Style::new().fg(dim),
-    ));
+
+    // Fit by priority: keep adding sections while they fit. The wide hint
+    // tier (5) is dropped before the short one (6).
+    sections.sort_by_key(|(_, p)| *p);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut dropped = false;
+    for (span, _) in sections {
+        let w = span.width();
+        if used + w <= width as usize {
+            spans.push(span);
+            used += w;
+        } else {
+            dropped = true;
+        }
+    }
+    if dropped {
+        let ellipsis = Span::styled("\u{2026}", Style::new().fg(dim));
+        if used + ellipsis.width() <= width as usize {
+            spans.push(ellipsis);
+        }
+    }
     Line::from(spans)
 }
 
@@ -578,4 +623,236 @@ fn install_panic_hook() {
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         original(panic_info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::demo;
+    use crate::theme::{self, ColorDepth};
+    use crate::visualizers::{self, RenderScratch};
+    use ratatui::buffer::Buffer;
+
+    fn demo_app() -> App {
+        let shared = Arc::new(Mutex::new(SharedState {
+            latest: Arc::new(FrameAnalysis::quiet(64)),
+            params: crate::analysis::Params {
+                sensitivity: 1.0,
+                fall: 0.12,
+            },
+            beats_pending: 0,
+        }));
+        App::new(
+            &shared,
+            &crate::audio::AudioHandle::for_demo(),
+            "spectrum",
+            ColorDepth::True,
+        )
+    }
+
+    fn span_text(line: &Line<'_>) -> String {
+        line.spans.iter().flat_map(|s| s.content.chars()).collect()
+    }
+
+    #[test]
+    fn status_fits_every_width() {
+        let app = demo_app();
+        let audio = crate::audio::AudioHandle::for_demo();
+        for w in [24u16, 40, 60, 80, 100, 120, 144, 200] {
+            let line = status_line(&app, &audio, Color::White, w);
+            let width: usize = line.spans.iter().map(|s| s.width()).sum();
+            assert!(
+                width <= w as usize,
+                "status width {width} exceeds {w}: {}",
+                span_text(&line)
+            );
+        }
+    }
+
+    #[test]
+    fn status_keeps_priorities_and_no_demo_dup() {
+        let app = demo_app();
+        let audio = crate::audio::AudioHandle::for_demo();
+
+        // Wide: full hints and all fields present.
+        let wide = status_line(&app, &audio, Color::White, 144);
+        let text = span_text(&wide);
+        assert!(text.contains("demo"), "chip missing: {text}");
+        assert!(text.contains("synthetic"), "source missing: {text}");
+        assert!(text.contains("q quit"), "wide hints missing: {text}");
+        // No duplicated DEMO banner (the title carries it).
+        assert_eq!(text.matches("DEMO").count(), 0, "duplicated DEMO: {text}");
+
+        // Narrow: the short hints tier survives, wide hints drop.
+        let narrow = status_line(&app, &audio, Color::White, 56);
+        let ntext = span_text(&narrow);
+        assert!(ntext.contains("demo"), "chip must survive: {ntext}");
+        assert!(
+            ntext.contains("h help") || ntext.contains('\u{2026}'),
+            "short hints or ellipsis expected: {ntext}"
+        );
+        assert!(
+            !ntext.contains("1-5 modes"),
+            "wide hints must drop: {ntext}"
+        );
+    }
+
+    #[test]
+    fn demo_modes_render_at_matched_phase() {
+        // Loud (drop) phase, one buffer per mode at the reviewer's size.
+        let theme = theme::find_with_depth("spectrum", ColorDepth::True).unwrap();
+        let frame = demo::synthetic_frame(5.0, 64);
+        let area = Rect::new(0, 0, 144, 40);
+
+        let mut scratch = RenderScratch::default();
+        let mut peaks = Vec::new();
+        let mut bars_buf = Buffer::empty(area);
+        visualizers::render_spectrum(
+            &mut bars_buf,
+            area,
+            &frame.bars,
+            &theme,
+            &mut peaks,
+            &mut scratch,
+            1.0 / 60.0,
+        );
+        let bars_filled = nonblank(&bars_buf);
+        assert!(bars_filled > 300, "bars mode too sparse: {bars_filled}");
+
+        // Oscilloscope has a waveform during the loud phase.
+        let mut scope_buf = Buffer::empty(area);
+        visualizers::render_oscilloscope(
+            &mut scope_buf,
+            area,
+            &frame.waveform,
+            &theme,
+            1.1,
+            &mut scratch,
+        );
+        assert!(nonblank(&scope_buf) > 20, "scope too sparse");
+
+        // Mirror renders around the center line.
+        let mut mirror_buf = Buffer::empty(area);
+        visualizers::render_mirror(&mut mirror_buf, area, &frame.bars, &theme, &mut scratch);
+        assert!(nonblank(&mirror_buf) > 300, "mirror too sparse");
+
+        // Spectrogram: push a few columns of history at the same phase.
+        let mut cols = std::collections::VecDeque::new();
+        for k in 0..30u32 {
+            let f = demo::synthetic_frame(5.0 - k as f32 * 0.033, 64);
+            cols.push_back(f.spectrum);
+        }
+        let mut gram_buf = Buffer::empty(area);
+        visualizers::render_spectrogram(&mut gram_buf, area, &cols, &theme);
+        assert!(nonblank_bg(&gram_buf) > 200, "spectrogram too sparse");
+    }
+
+    #[test]
+    fn demo_silence_and_fade_render_quietly() {
+        let theme = theme::find_with_depth("spectrum", ColorDepth::True).unwrap();
+        let mut scratch = RenderScratch::default();
+        let mut peaks = Vec::new();
+        let area = Rect::new(0, 0, 80, 24);
+
+        // Silence: an intentionally near-empty field (dynamics preserved,
+        // nothing normalized away).
+        let silent = demo::synthetic_frame(7.9, 64);
+        assert!(silent.bars.iter().all(|v| *v <= 0.01));
+        let mut buf = Buffer::empty(area);
+        visualizers::render_spectrum(
+            &mut buf,
+            area,
+            &silent.bars,
+            &theme,
+            &mut peaks,
+            &mut scratch,
+            1.0 / 60.0,
+        );
+        assert!(nonblank(&buf) <= 2, "silence should render almost empty");
+
+        // Fade: clearly less filled than the loud drop.
+        let fade = demo::synthetic_frame(6.8, 64);
+        let mut fade_buf = Buffer::empty(area);
+        visualizers::render_spectrum(
+            &mut fade_buf,
+            area,
+            &fade.bars,
+            &theme,
+            &mut peaks,
+            &mut scratch,
+            1.0 / 60.0,
+        );
+        let loud = demo::synthetic_frame(5.0, 64);
+        let mut loud_buf = Buffer::empty(area);
+        visualizers::render_spectrum(
+            &mut loud_buf,
+            area,
+            &loud.bars,
+            &theme,
+            &mut peaks,
+            &mut scratch,
+            1.0 / 60.0,
+        );
+        assert!(
+            nonblank(&fade_buf) < nonblank(&loud_buf),
+            "fade ({}) should be quieter than loud ({})",
+            nonblank(&fade_buf),
+            nonblank(&loud_buf)
+        );
+    }
+
+    #[test]
+    fn truecolor_dither_enriches_but_palette_stays_coherent() {
+        // Same frame, same size: truecolor dithering must produce more
+        // distinct colors than the 256-color rendering, while both use
+        // their own coherent (non-random) palettes.
+        let frame = demo::synthetic_frame(5.0, 64);
+        let area = Rect::new(0, 0, 100, 30);
+
+        let render = |theme: &crate::theme::Theme| -> usize {
+            let mut scratch = RenderScratch::default();
+            let mut peaks = Vec::new();
+            let mut buf = Buffer::empty(area);
+            visualizers::render_spectrum(
+                &mut buf,
+                area,
+                &frame.bars,
+                theme,
+                &mut peaks,
+                &mut scratch,
+                1.0 / 60.0,
+            );
+            distinct_fg(&buf)
+        };
+
+        let true_theme = theme::find_with_depth("fire", ColorDepth::True).unwrap();
+        let p256_theme = theme::find_with_depth("fire", ColorDepth::P256).unwrap();
+        let n_true = render(&true_theme);
+        let n_256 = render(&p256_theme);
+        assert!(n_true >= 2, "truecolor dither must be visible: {n_true}");
+        assert!(
+            n_true >= n_256,
+            "truecolor ({n_true}) should use at least as many colors as 256 ({n_256})"
+        );
+    }
+
+    fn nonblank(buf: &Buffer) -> usize {
+        (0..buf.area.width * buf.area.height)
+            .filter(|i| buf.content[*i as usize].symbol() != " ")
+            .count()
+    }
+
+    fn nonblank_bg(buf: &Buffer) -> usize {
+        (0..buf.area.width * buf.area.height)
+            .filter(|i| buf.content[*i as usize].bg != ratatui::style::Color::Reset)
+            .count()
+    }
+
+    fn distinct_fg(buf: &Buffer) -> usize {
+        let mut set = std::collections::HashSet::new();
+        for i in 0..(buf.area.width * buf.area.height) {
+            set.insert(buf.content[i as usize].fg);
+        }
+        set.len()
+    }
 }

@@ -114,10 +114,12 @@ pub fn render_spectrum(
             put(buf, x, y, ch, theme.at_dither(t, x, y));
         }
 
-        // Peak cap marker.
+        // Peak cap marker: only when the held peak sits strictly above the
+        // current bar top, so it marks receding peaks without clipping the
+        // bar's own tip.
         let peak = peaks[x];
         let prow = (peak * h as f32).round() as usize;
-        if prow >= 1 && prow <= h {
+        if prow > full.min(h) && prow <= h {
             let y = area.y + (h - prow) as u16;
             let x = area.x + x as u16;
             put(buf, x, y, '\u{2594}', theme.at_dither(1.0, x, y));
@@ -181,8 +183,9 @@ pub fn render_oscilloscope(
         grid[gy * w + gx] |= braille_bit(i % 2, sy % 4);
     }
 
-    // Heat coloring: brightness grows with distance from the centerline,
-    // so loud excursions light up while quiet passages stay dim.
+    // Trace coloring: bright at the centerline where the waveform lives
+    // and hottest at loud excursions - the trace must read clearly over
+    // the bars behind it, never fading into the background.
     let center = (sub_rows - 1) as f32 * 0.5;
     for gy in 0..h {
         for gx in 0..w {
@@ -193,12 +196,13 @@ pub fn render_oscilloscope(
             let ch = char::from_u32(0x2800 + bits as u32).unwrap_or('\u{28FF}');
             let sub_y = gy as f32 * 4.0 + 1.5;
             let dist = ((sub_y - center) / center.max(1.0)).abs().min(1.0);
+            let heat = (0.55 + 0.45 * dist).min(1.0);
             put(
                 buf,
                 area.x + gx as u16,
                 area.y + gy as u16,
                 ch,
-                theme.at_dither(dist, area.x + gx as u16, area.y + gy as u16),
+                theme.at_dither(heat, area.x + gx as u16, area.y + gy as u16),
             );
         }
     }
