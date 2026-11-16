@@ -45,7 +45,6 @@ impl Params {
     }
 }
 
-#[derive(Clone)]
 pub struct FrameAnalysis {
     /// Smoothed per-band magnitude in 0..=1, low -> high frequency.
     pub bars: Vec<f32>,
@@ -70,7 +69,9 @@ impl FrameAnalysis {
 }
 
 pub struct SharedState {
-    pub latest: FrameAnalysis,
+    /// Published analysis frame; shared by pointer so the UI never
+    /// deep-copies bars/spectrum/waveform per frame.
+    pub latest: Arc<FrameAnalysis>,
     pub params: Params,
     /// Beats detected since the UI last looked; lets the UI never miss one.
     pub beats_pending: u32,
@@ -311,7 +312,7 @@ pub fn spawn_analyzer(
                 if frame.beat {
                     sh.beats_pending = sh.beats_pending.saturating_add(1);
                 }
-                sh.latest = frame;
+                sh.latest = Arc::new(frame);
             }
         })
         .expect("failed to spawn analyzer thread")

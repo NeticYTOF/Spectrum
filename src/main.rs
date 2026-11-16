@@ -70,7 +70,7 @@ fn main() -> Result<()> {
     };
 
     let shared = Arc::new(Mutex::new(SharedState {
-        latest: FrameAnalysis::quiet(bands),
+        latest: Arc::new(FrameAnalysis::quiet(bands)),
         params: Params {
             sensitivity: args.sensitivity,
             fall: args.smoothing,

@@ -148,7 +148,7 @@ fn event_loop(
             let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
             let beat = state.beats_pending > 0;
             state.beats_pending = 0;
-            (state.latest.clone(), beat)
+            (Arc::clone(&state.latest), beat)
         };
 
         if beat {
