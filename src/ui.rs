@@ -28,6 +28,8 @@ pub enum Mode {
     Bars,
     Scope,
     Gram,
+    Combo,
+    Mirror,
 }
 
 impl Mode {
@@ -36,6 +38,8 @@ impl Mode {
             Mode::Bars => "Spectrum Analyzer",
             Mode::Scope => "Oscilloscope",
             Mode::Gram => "Spectrogram",
+            Mode::Combo => "Bars + Wave",
+            Mode::Mirror => "Mirrored Spectrum",
         }
     }
 
@@ -43,15 +47,19 @@ impl Mode {
         match self {
             Mode::Bars => Mode::Scope,
             Mode::Scope => Mode::Gram,
-            Mode::Gram => Mode::Bars,
+            Mode::Gram => Mode::Combo,
+            Mode::Combo => Mode::Mirror,
+            Mode::Mirror => Mode::Bars,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Mode::Bars => Mode::Gram,
+            Mode::Bars => Mode::Mirror,
             Mode::Scope => Mode::Bars,
             Mode::Gram => Mode::Scope,
+            Mode::Combo => Mode::Gram,
+            Mode::Mirror => Mode::Combo,
         }
     }
 }
@@ -230,6 +238,8 @@ fn on_key(app: &mut App, shared: &Arc<Mutex<SharedState>>, audio: &AudioHandle, 
         KeyCode::Char('1') => set_mode(app, Mode::Bars),
         KeyCode::Char('2') => set_mode(app, Mode::Scope),
         KeyCode::Char('3') => set_mode(app, Mode::Gram),
+        KeyCode::Char('4') => set_mode(app, Mode::Combo),
+        KeyCode::Char('5') => set_mode(app, Mode::Mirror),
         KeyCode::Tab => set_mode(app, app.mode.next()),
         KeyCode::BackTab => set_mode(app, app.mode.prev()),
         KeyCode::Char(' ') => {
@@ -347,6 +357,36 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
             scratch,
             dt,
         ),
+        Mode::Combo => {
+            visualizers::render_spectrum(
+                f.buffer_mut(),
+                inner,
+                &analysis.bars,
+                theme,
+                peaks,
+                scratch,
+                dt,
+            );
+            // Waveform overlaid on a centered band of the bar field.
+            let wave_h = (inner.height / 2).clamp(2, inner.height);
+            let wave = Rect::new(
+                inner.x,
+                inner.y + (inner.height - wave_h) / 2,
+                inner.width,
+                wave_h,
+            );
+            visualizers::render_oscilloscope(
+                f.buffer_mut(),
+                wave,
+                &analysis.waveform,
+                theme,
+                0.9,
+                scratch,
+            );
+        }
+        Mode::Mirror => {
+            visualizers::render_mirror(f.buffer_mut(), inner, &analysis.bars, theme, scratch)
+        }
         Mode::Scope => visualizers::render_oscilloscope(
             f.buffer_mut(),
             inner,
@@ -429,7 +469,7 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, flux: f32) -> Line
         Style::new().fg(accent),
     ));
     spans.push(Span::styled(
-        "1/2/3 modes \u{b7} space pause \u{b7} t theme \u{b7} h help \u{b7} q quit",
+        "1-5 modes \u{b7} space pause \u{b7} t theme \u{b7} h help \u{b7} q quit",
         Style::new().fg(dim),
     ));
     Line::from(spans)
@@ -450,7 +490,10 @@ fn help_text(accent: Color) -> Vec<Line<'static>> {
     ))];
     lines.push(Line::from(""));
     lines.extend([
-        mk("1 / 2 / 3", "switch visualization"),
+        mk(
+            "1 / 2 / 3 / 4 / 5",
+            "spectrum \u{b7} scope \u{b7} spectrogram \u{b7} combo \u{b7} mirror",
+        ),
         mk("Tab / Shift+Tab", "cycle visualizations"),
         mk("Space", "pause / resume audio"),
         mk("\u{2191} / \u{2193}", "volume (file mode)"),

@@ -206,6 +206,61 @@ pub fn render_oscilloscope(
     }
 }
 
+/// Mirrored spectrum: bars grow outward from a horizontal center line,
+/// the top half rendered upside-down relative to the bottom half.
+pub fn render_mirror(
+    buf: &mut Buffer,
+    area: Rect,
+    bars: &[f32],
+    theme: &Theme,
+    scratch: &mut RenderScratch,
+) {
+    if area.width == 0 || area.height < 2 {
+        return;
+    }
+    let w = area.width as usize;
+    let h = area.height as usize;
+    fill_sample_bars(bars, w, &mut scratch.bars);
+    let half = h / 2;
+    let bottom = h - half;
+
+    for x in 0..w {
+        let v = scratch.bars[x].clamp(0.0, 1.0);
+        let filled = v * half as f32;
+        let full = filled.floor() as usize;
+        let frac = filled - full as f32;
+        let sx = area.x + x as u16;
+
+        // Top half: grows upward from the center line; the partial tip
+        // uses bottom-filled blocks like ordinary bars.
+        for j in 0..full.min(half) {
+            let y = area.y + (half - 1 - j) as u16;
+            let t = (j + 1) as f32 / half as f32;
+            put(buf, sx, y, BLOCKS[7], theme.at_dither(t, sx, y));
+        }
+        if full < half && frac > 0.06 {
+            let y = area.y + (half - 1 - full) as u16;
+            let t = (full + 1) as f32 / half as f32;
+            let ch = BLOCKS[((frac * 8.0) as usize).min(7)];
+            put(buf, sx, y, ch, theme.at_dither(t, sx, y));
+        }
+
+        // Bottom half: grows downward from the center line; the partial
+        // tip (which visually hangs from the block above it) uses an
+        // upper-half block when more than half filled.
+        for j in 0..full.min(bottom) {
+            let y = area.y + (half + j) as u16;
+            let t = (j + 1) as f32 / half as f32;
+            put(buf, sx, y, BLOCKS[7], theme.at_dither(t, sx, y));
+        }
+        if full < bottom && frac > 0.5 {
+            let y = area.y + (half + full) as u16;
+            let t = (full + 1) as f32 / half as f32;
+            put(buf, sx, y, '\u{2580}', theme.at_dither(t, sx, y));
+        }
+    }
+}
+
 /// Scrolling spectrogram: rows = log-spaced frequency bands, columns = time.
 /// The newest column is drawn flush against the right edge.
 pub fn render_spectrogram(
@@ -357,6 +412,56 @@ mod tests {
         assert!(v.is_empty());
         fill_sample_bars(&[0.5], 1, &mut v);
         assert_eq!(v[0], 0.5);
+    }
+
+    #[test]
+    fn mirror_renders_outward_from_center() {
+        let theme = crate::theme::find("fire").unwrap();
+        let area = Rect::new(0, 0, 4, 6);
+        let mut buf = Buffer::empty(area);
+        let bars = vec![0.5, 0.5, 0.5, 0.5]; // half of each half -> 1 full + partial
+        let mut scratch = RenderScratch::new();
+        render_mirror(&mut buf, area, &bars, &theme, &mut scratch);
+
+        // With height 6 (half=3) and v=0.5: filled = 1.5 -> full=1, frac=0.5
+        // on the top: one full block just above center; bottom adds the
+        // same plus an upper-half tip when frac>0.5 (here exactly 0.5, so
+        // no tip). Center rows 2 (top) and 3 (bottom) must be full blocks.
+        assert_eq!(
+            buf[(0, 2)].symbol(),
+            "\u{2588}",
+            "top half grows from center"
+        );
+        assert_eq!(
+            buf[(0, 3)].symbol(),
+            "\u{2588}",
+            "bottom half grows from center"
+        );
+        // Nothing outside the mirrored extent.
+        assert_eq!(buf[(0, 0)].symbol(), " ");
+        assert_eq!(buf[(0, 5)].symbol(), " ");
+    }
+
+    #[test]
+    fn mirror_tolerates_degenerate_input() {
+        let theme = crate::theme::find("ice").unwrap();
+        let mut scratch = RenderScratch::new();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
+        render_mirror(
+            &mut buf,
+            Rect::new(0, 0, 4, 0),
+            &[0.5],
+            &theme,
+            &mut scratch,
+        );
+        render_mirror(
+            &mut buf,
+            Rect::new(0, 0, 4, 1),
+            &[0.5],
+            &theme,
+            &mut scratch,
+        );
+        render_mirror(&mut buf, Rect::new(0, 0, 4, 3), &[], &theme, &mut scratch);
     }
 
     #[test]
