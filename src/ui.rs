@@ -462,6 +462,11 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
 /// Build the status bar for a given width. Sections are ordered by
 /// priority; lower-priority ones are dropped whole (never truncated
 /// mid-string, so no broken glyphs) when the width can't fit everything.
+///
+/// Hints are mutually exclusive: the wide hint line is only shown when
+/// EVERYTHING fits; otherwise the short "h help \u{b7} q quit" tier takes
+/// precedence over the description and the tuning readouts, so help and
+/// quit stay discoverable at every width.
 fn status_line(app: &App, audio: &AudioHandle, accent: Color, width: u16) -> Line<'static> {
     let dim = Color::Rgb(130, 130, 130);
     let meta = audio.meta_snapshot();
@@ -497,8 +502,8 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, width: u16) -> Lin
 
     let warned = meta.status == "reconnecting" || meta.status == "degraded";
 
-    // (span, priority): smaller priority = kept when narrow.
-    let mut sections: Vec<(Span<'static>, u8)> = vec![
+    // Core sections, (span, priority): smaller priority survives first.
+    let mut base: Vec<(Span<'static>, u8)> = vec![
         (
             Span::styled(
                 format!("{icon} {state} "),
@@ -507,52 +512,76 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, width: u16) -> Lin
             0,
         ),
         (
+            Span::styled(format!("h help \u{b7} q quit "), Style::new().fg(dim)),
+            1,
+        ),
+        (
             Span::styled(
                 format!("{} ", meta.description),
                 Style::new().fg(if warned { Color::Yellow } else { Color::White }),
             ),
-            1,
+            2,
         ),
     ];
     if !audio.is_live() && !audio.demo {
-        sections.push((
+        base.push((
             Span::styled(
                 format!("vol {:>3.0}% ", app.volume * 100.0),
                 Style::new().fg(dim),
             ),
-            2,
+            3,
         ));
     }
-    sections.push((
+    base.push((
         Span::styled(
             format!("[{}:{}] ", app.theme().name, app.depth.name()),
             Style::new().fg(accent),
         ),
-        3,
+        4,
     ));
-    sections.push((
+    base.push((
         Span::styled(
             format!("sens {:.1} \u{b7} smooth {:.2} ", app.sensitivity, app.fall),
             Style::new().fg(dim),
         ),
-        4,
-    ));
-    sections.push((
-        Span::styled(
-            "1-5 modes \u{b7} space pause \u{b7} t theme \u{b7} h help \u{b7} q quit",
-            Style::new().fg(dim),
-        ),
         5,
     ));
-    sections.push((
-        Span::styled("h help \u{b7} q quit", Style::new().fg(dim)),
-        6,
-    ));
 
-    // Fit by priority: keep adding sections while they fit. The wide hint
-    // tier (5) is dropped before the short one (6).
+    let wide = Span::styled(
+        "1-5 modes \u{b7} space pause \u{b7} t theme \u{b7} h help \u{b7} q quit",
+        Style::new().fg(dim),
+    );
+
+    // Pass 1: replace the short hint tier with the wide hint line; if it
+    // fits entirely, use it.
+    let wide_pass = {
+        let mut sections: Vec<(Span<'static>, u8)> =
+            base.iter().filter(|(_, p)| *p != 1).cloned().collect();
+        sections.push((wide, 6));
+        fit_sections(sections, width)
+    };
+    if !wide_pass.1 {
+        return Line::from(wide_pass.0);
+    }
+
+    // Pass 2: short hints at high priority; anything low-priority drops.
+    let short_pass = fit_sections(base, width);
+    let mut spans = short_pass.0;
+    if short_pass.1 {
+        let ellipsis = Span::styled("\u{2026}", Style::new().fg(dim));
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        if used + ellipsis.width() <= width as usize {
+            spans.push(ellipsis);
+        }
+    }
+    Line::from(spans)
+}
+
+/// Fit sections by priority into `width`, returning the kept spans and
+/// whether anything was dropped. Spans are kept or dropped whole.
+fn fit_sections(mut sections: Vec<(Span<'static>, u8)>, width: u16) -> (Vec<Span<'static>>, bool) {
     sections.sort_by_key(|(_, p)| *p);
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut spans = Vec::new();
     let mut used = 0usize;
     let mut dropped = false;
     for (span, _) in sections {
@@ -564,13 +593,7 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, width: u16) -> Lin
             dropped = true;
         }
     }
-    if dropped {
-        let ellipsis = Span::styled("\u{2026}", Style::new().fg(dim));
-        if used + ellipsis.width() <= width as usize {
-            spans.push(ellipsis);
-        }
-    }
-    Line::from(spans)
+    (spans, dropped)
 }
 
 fn help_text(accent: Color) -> Vec<Line<'static>> {
@@ -658,7 +681,7 @@ mod tests {
     fn status_fits_every_width() {
         let app = demo_app();
         let audio = crate::audio::AudioHandle::for_demo();
-        for w in [24u16, 40, 60, 80, 100, 120, 144, 200] {
+        for w in [20u16, 24, 30, 40, 56, 60, 72, 80, 100, 120, 144, 200] {
             let line = status_line(&app, &audio, Color::White, w);
             let width: usize = line.spans.iter().map(|s| s.width()).sum();
             assert!(
@@ -670,21 +693,48 @@ mod tests {
     }
 
     #[test]
-    fn status_keeps_priorities_and_no_demo_dup() {
+    fn status_hints_never_duplicated() {
+        // Regression: at wide widths both the wide and short hint lines
+        // used to render ("... q quit h help \u{b7} q quit").
+        let app = demo_app();
+        let audio = crate::audio::AudioHandle::for_demo();
+        for w in [24u16, 30, 40, 56, 60, 72, 80, 100, 120, 144, 160, 200] {
+            let text = span_text(&status_line(&app, &audio, Color::White, w));
+            assert_eq!(
+                text.matches("q quit").count(),
+                if text.contains("1-5 modes") { 1 } else { 1 },
+                "hint duplication at width {w}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_hint_priority_over_tuning_and_device() {
         let app = demo_app();
         let audio = crate::audio::AudioHandle::for_demo();
 
-        // Wide: full hints and all fields present.
+        // Wide: the full hint line replaces the short one, everything fits.
         let wide = status_line(&app, &audio, Color::White, 144);
         let text = span_text(&wide);
         assert!(text.contains("demo"), "chip missing: {text}");
         assert!(text.contains("synthetic"), "source missing: {text}");
-        assert!(text.contains("q quit"), "wide hints missing: {text}");
-        // No duplicated DEMO banner (the title carries it).
+        assert!(text.contains("1-5 modes"), "wide hints missing: {text}");
+        assert!(!text.contains("h help \u{b7} q quit h"), "dup: {text}");
         assert_eq!(text.matches("DEMO").count(), 0, "duplicated DEMO: {text}");
 
-        // Narrow: the short hints tier survives, wide hints drop.
-        let narrow = status_line(&app, &audio, Color::White, 56);
+        // Medium (72 cols, the reviewer's case): description and tuning
+        // give way, but help/quit must survive.
+        let medium = status_line(&app, &audio, Color::White, 72);
+        let mtext = span_text(&medium);
+        assert!(mtext.contains("demo"), "chip must survive: {mtext}");
+        assert!(
+            mtext.contains("h help"),
+            "help/quit discoverability must outrank tuning at 72 cols: {mtext}"
+        );
+        assert_eq!(mtext.matches("q quit").count(), 1, "dup at 72: {mtext}");
+
+        // Narrow: tuning drops before the hints; the chip always stays.
+        let narrow = status_line(&app, &audio, Color::White, 46);
         let ntext = span_text(&narrow);
         assert!(ntext.contains("demo"), "chip must survive: {ntext}");
         assert!(
