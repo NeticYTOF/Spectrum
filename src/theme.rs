@@ -143,8 +143,6 @@ fn nearest_ansi16(rgb: [u8; 3]) -> u8 {
 #[derive(Clone)]
 pub struct Theme {
     pub name: &'static str,
-    depth: ColorDepth,
-    stops: &'static [Stop],
     /// Depth-quantized gradient lookup: exact RGB steps for True, nearest
     /// palette entries for P256/Ansi16. `at_dither` dithers between
     /// adjacent steps of this same table for every depth.
@@ -282,12 +280,7 @@ fn build_theme(name: &'static str, stops: &'static [Stop], depth: ColorDepth) ->
             }
         })
         .collect();
-    Theme {
-        name,
-        depth,
-        stops,
-        gradient,
-    }
+    Theme { name, gradient }
 }
 
 /// All available themes at true color depth, gradients precomputed.
@@ -483,12 +476,12 @@ mod tests {
             assert!(matches!(t.gradient[i], Color::Indexed(_)));
         }
         // Dither output is always one of the baked gradient entries,
-        // hence a valid xterm index.
+        // hence a valid palette index.
         for i in 0..=16 {
-            match t.at_dither(i as f32 / 16.0, 3, 7) {
-                Color::Indexed(idx) => assert!(idx <= 255, "idx {idx}"),
-                other => panic!("expected Indexed, got {other:?}"),
-            }
+            assert!(matches!(
+                t.at_dither(i as f32 / 16.0, 3, 7),
+                Color::Indexed(_)
+            ));
         }
     }
 
