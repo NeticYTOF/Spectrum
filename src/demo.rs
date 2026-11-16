@@ -16,9 +16,78 @@ use crate::analysis::{FrameAnalysis, SharedState};
 /// Demo tick rate, matching the analyzer thread's cadence.
 const DEMO_TICK: Duration = Duration::from_millis(15);
 /// One cycle of the synthetic structure, in seconds.
-const CYCLE_SECS: f32 = 8.0;
+pub const CYCLE_SECS: f32 = 8.0;
 /// Beat cadence during the energetic sections (120 BPM).
 const BEAT_SECS: f32 = 0.5;
+
+/// The demo "track": original fixture text written for this project (not
+/// real song lyrics), timed against the 8 s cycle so the lyrics garden has
+/// something honest to render without any media session.
+pub const DEMO_TRACK_TITLE: &str = "Garden of Sound";
+pub const DEMO_TRACK_ARTIST: &str = "Spectrum Fixture";
+
+pub fn demo_lyric_lines() -> Vec<crate::lrc::LrcLine> {
+    use crate::lrc::LrcLine;
+    [
+        (0.2, "Little signals in the dark"),
+        (1.8, "grow a garden out of sound"),
+        (3.4, "every beat a budding bloom"),
+        (5.0, "silence is the resting soil"),
+        (6.6, "and the night hums on"),
+    ]
+    .into_iter()
+    .map(|(t, text)| LrcLine {
+        time_s: t,
+        text: text.to_string(),
+    })
+    .collect()
+}
+
+/// A demo media snapshot at cycle position `pos` (seconds).
+pub fn demo_snapshot(pos: f64, paused: bool) -> crate::media::MediaSnapshot {
+    crate::media::MediaSnapshot {
+        available: true,
+        title: DEMO_TRACK_TITLE.to_string(),
+        artist: DEMO_TRACK_ARTIST.to_string(),
+        album: String::new(),
+        duration_s: Some(CYCLE_SECS as f64),
+        position_s: pos,
+        playing: !paused,
+    }
+}
+
+/// A demo "media session" thread: publishes the synthetic timeline so the
+/// lyrics garden works identically without any real player. With
+/// `freeze_at`, the position is pinned for deterministic frames.
+pub fn spawn_demo_media(
+    shared: crate::media::MediaShared,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    freeze_at: Option<f32>,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("spectrum-demo-media".into())
+        .spawn(move || {
+            let cycle = CYCLE_SECS as f64;
+            let mut t = 0.0f64;
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let is_paused = paused.load(Ordering::Relaxed);
+                if freeze_at.is_none() && !is_paused {
+                    t += 0.1;
+                }
+                let pos = freeze_at.map(|f| f as f64).unwrap_or(t % cycle);
+                {
+                    let mut snap = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    *snap = demo_snapshot(pos, is_paused || freeze_at.is_some());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+        .expect("failed to spawn demo media thread")
+}
 
 /// Kick drum envelope: exponential decay after each beat.
 fn kick(t_since_beat: f32) -> f32 {

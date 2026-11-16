@@ -6,6 +6,10 @@
 pub mod analysis;
 pub mod audio;
 pub mod demo;
+pub mod garden;
+pub mod lrc;
+pub mod lyrics;
+pub mod media;
 pub mod theme;
 pub mod ui;
 pub mod visualizers;
