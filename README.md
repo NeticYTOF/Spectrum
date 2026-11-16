@@ -20,11 +20,11 @@ with Unicode blocks, braille dots and ANSI color.
 - **Spectrogram** - scrolling frequency heatmap, newest at the right edge
 - **Bars + Wave** - oscilloscope overlaid on the spectrum bars
 - **Mirrored spectrum** - bars growing outward from a center line
-- **Lyrics garden** - synced lyrics (LRCLIB, community-sourced) as a
-  dot-matrix garden: the current line in Braille dot text with curling
-  stems and blooming flowers, driven by Windows SMTC metadata; honest
-  states for unsynced/instrumental/no-match/offline, normal-text fallback
-  when narrow
+- **Lyrics garden** - synced lyrics (LRCLIB, community-sourced) as an
+  ASCII garden: the current line in serif type with curling stems,
+  leaves and shaded roses growing out of the letters, driven by Windows
+  SMTC metadata; honest states for unsynced/instrumental/no-match/
+  offline, normal-text fallback for unsupported scripts
 - **Beat detection** - spectral flux drives a border/`♪` flash
 - **Color themes** - spectrum, fire, ice, matrix, vapor; gradients get a
   deliberate ordered-stipple dither between steps (visible in truecolor,
@@ -121,10 +121,14 @@ Lyrics are community-sourced; their rights remain with their owners and
 no accuracy or completeness is promised (see NOTICE). `--demo --mode 6`
 renders the same garden from an original fixture track with no network.
 
-The garden's look (paper backdrop, dot-matrix text, curling stems,
-blooming flowers, spring-eased growth) is a terminal port of the design
-of ridit-jangra/ascii-garden (MIT, (c) 2026 Ridit; notice preserved in
-NOTICE), itself a reinterpretation of Akshat Agarwal's Type Garden.
+The garden is a direct port of the rendering algorithms of
+ridit-jangra/ascii-garden (MIT, (c) 2026 Ridit; notice preserved in
+NOTICE; port map in docs/PORT-PLAN.md), itself a reinterpretation of
+Akshat Agarwal's Type Garden, whose cell-grid ASCII approach comes from
+ascii-animals. Every cell is classified from a subpixel coverage mask
+into glyph families, exactly as upstream. The serif letterforms are
+original bitmaps drawn for this project in Playfair-style proportions
+- no font files are bundled (see docs/PORT-PLAN.md).
 
 ## Platform notes
 

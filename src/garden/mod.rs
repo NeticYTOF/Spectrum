@@ -206,6 +206,11 @@ fn render_garden_line(buf: &mut Buffer, area: Rect, text: &str, view: &GardenVie
             ty: p.ty,
             els: e,
             birth_ms: i as f32 * 45.0,
+            word_end: data
+                .placements
+                .get(i + 1)
+                .map(|n| n.ch == ' ')
+                .unwrap_or(true),
         })
         .collect();
 

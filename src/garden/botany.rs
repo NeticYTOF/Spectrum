@@ -834,6 +834,9 @@ pub struct SceneLetter<'a> {
     pub els: &'a LetterEls,
     /// Birth offset from the line start, ms (staggered regrow).
     pub birth_ms: f32,
+    /// True when the next letter is a space or this is the last letter:
+    /// the reference draws the end-of-word tendril only here.
+    pub word_end: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -961,11 +964,14 @@ pub fn draw_scene(
         for el in &l.els.els {
             draw_el(g, l, el, age, 0);
         }
-        // The end-of-word tendril grows on both layers when the word ends.
-        if let Some(tend) = &l.els.tend {
-            let fr = eo((age - 150.0) / 450.0);
-            if fr > 0.0 {
-                draw_el(g, l, tend, age, 0);
+        // The end-of-word tendril grows only at word ends (garden.ts
+        // checks the next letter being a space).
+        if l.word_end {
+            if let Some(tend) = &l.els.tend {
+                let fr = eo((age - 150.0) / 450.0);
+                if fr > 0.0 {
+                    draw_el(g, l, tend, age, 0);
+                }
             }
         }
     }
@@ -979,10 +985,12 @@ pub fn draw_scene(
         for el in &l.els.els {
             draw_el(g, l, el, age, 1);
         }
-        if let Some(tend) = &l.els.tend {
-            let fr = eo((age - 150.0) / 450.0);
-            if fr > 0.0 {
-                draw_el(g, l, tend, age, 1);
+        if l.word_end {
+            if let Some(tend) = &l.els.tend {
+                let fr = eo((age - 150.0) / 450.0);
+                if fr > 0.0 {
+                    draw_el(g, l, tend, age, 1);
+                }
             }
         }
     }
@@ -1062,6 +1070,7 @@ mod tests {
             ty: 6.0,
             els: &els,
             birth_ms: 0.0,
+            word_end: true,
         }];
         let mut g = MaskGrid::new(12, 8);
         draw_scene(&mut g, &letters, 8.0, 5000.0, 0.3, 12.0);
