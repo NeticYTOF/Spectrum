@@ -512,7 +512,7 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, width: u16) -> Lin
             0,
         ),
         (
-            Span::styled(format!("h help \u{b7} q quit "), Style::new().fg(dim)),
+            Span::styled("h help \u{b7} q quit ", Style::new().fg(dim)),
             1,
         ),
         (
@@ -702,7 +702,7 @@ mod tests {
             let text = span_text(&status_line(&app, &audio, Color::White, w));
             assert_eq!(
                 text.matches("q quit").count(),
-                if text.contains("1-5 modes") { 1 } else { 1 },
+                1,
                 "hint duplication at width {w}: {text}"
             );
         }
