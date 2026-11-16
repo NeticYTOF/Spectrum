@@ -1,9 +1,3 @@
-mod analysis;
-mod audio;
-mod theme;
-mod ui;
-mod visualizers;
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use crate::analysis::{FrameAnalysis, Params, SharedState, DEFAULT_BANDS};
-use crate::audio::SampleQueue;
-use crate::theme::ColorDepth;
+use spectrum::analysis::{FrameAnalysis, Params, SharedState, DEFAULT_BANDS};
+use spectrum::audio::SampleQueue;
+use spectrum::theme::{self, ColorDepth};
+use spectrum::{analysis, audio, ui};
 
 #[derive(Parser, Debug)]
 #[command(
