@@ -244,16 +244,11 @@ impl Analyzer {
         }
         self.prev_mags.copy_from_slice(&self.mags);
 
-        // Waveform: recent tail, aligned to a rising zero crossing so the
-        // scope stays visually stable instead of jumping around.
-        let take = self.history.len().min(1_100);
-        let tail: Vec<f32> = self
-            .history
-            .iter()
-            .skip(self.history.len() - take)
-            .copied()
-            .collect();
-        let waveform = zero_align(tail);
+        // Waveform: trigger on the first rising zero crossing where a
+        // full display window still fits, then show a fixed-length window
+        // from there. (The old backward scan triggered on the LAST
+        // crossing and left under a period on screen.)
+        let waveform = waveform_window(&self.history);
 
         FrameAnalysis {
             bars: self.bars.clone(),
@@ -272,17 +267,47 @@ fn norm(mag: f32, sensitivity: f32) -> f32 {
     (v * sensitivity).clamp(0.0, 1.0)
 }
 
-fn zero_align(mut sig: Vec<f32>) -> Vec<f32> {
-    if sig.len() < 2 {
-        return sig;
+/// Oscilloscope trigger search region: ~46 ms at 44.1 kHz. Guarantees at
+/// least one rising crossing for anything above ~22 Hz.
+const WAVE_SEARCH: usize = 2048;
+/// Oscilloscope display window: a fixed ~17 ms of signal.
+const WAVE_DISPLAY: usize = 768;
+
+/// Oscilloscope display window: phase-aligned and fixed-length.
+///
+/// Searches forward from the start of the recent search region for the
+/// first rising zero crossing from which a full `WAVE_DISPLAY` window
+/// still fits, and returns exactly that window. This keeps the trace
+/// phase-stable while the time axis never stretches. When no crossing
+/// exists in the allowed range (silence, DC, sub-audio frequencies), the
+/// newest samples are shown instead - the display never goes blank and
+/// never shrinks merely because a crossing happened near the end.
+fn waveform_window(history: &VecDeque<f32>) -> Vec<f32> {
+    if history.is_empty() {
+        return Vec::new();
     }
-    for i in (0..sig.len() - 1).rev() {
-        if sig[i] <= 0.0 && sig[i + 1] > 0.0 {
-            sig.drain(..i);
-            break;
+    let search = history.len().min(WAVE_SEARCH);
+    let start = history.len() - search;
+    // Earliest position from which a full display window still fits.
+    let full_end = history.len().saturating_sub(WAVE_DISPLAY);
+    let hi = full_end.min(start + WAVE_SEARCH);
+
+    let mut trigger = None;
+    if start < hi {
+        for i in start..hi {
+            if history[i] <= 0.0 && history[i + 1] > 0.0 {
+                trigger = Some(i);
+                break;
+            }
         }
     }
-    sig
+    let from = trigger.unwrap_or(full_end);
+    history
+        .iter()
+        .skip(from)
+        .take(WAVE_DISPLAY)
+        .copied()
+        .collect()
 }
 
 /// Run the analysis loop on its own thread at ~60 Hz.
@@ -394,18 +419,87 @@ mod tests {
     }
 
     #[test]
-    fn zero_align_starts_at_rising_crossing() {
-        let sig = vec![1.0, -0.5, 0.5, -0.2, 0.8, -0.1, 0.3, 0.9];
-        let aligned = zero_align(sig);
-        assert_eq!(aligned[0], -0.1);
-        assert_eq!(aligned.len(), 3);
+    fn waveform_window_fixed_length_and_triggered() {
+        // Regression for the reported bug: a 440 Hz sine at 44.1 kHz used
+        // to leave only ~87 samples (< 1 period) on screen.
+        let params = Params {
+            sensitivity: 1.0,
+            fall: 0.2,
+        };
+        let mut an = Analyzer::new(44_100, 64);
+        feed_sine(&mut an, 44_100.0, 440.0, 4096);
+        let frame = an.tick(&params, true);
+        assert_eq!(frame.waveform.len(), WAVE_DISPLAY);
+        assert!(frame.waveform[0] <= 0.0, "must trigger on a crossing");
+        assert!(frame.waveform[1] > 0.0, "must be a rising crossing");
     }
 
     #[test]
-    fn zero_align_keeps_signal_without_crossing() {
-        let sig = vec![0.5, 0.9, 0.2];
-        let aligned = zero_align(sig.clone());
-        assert_eq!(aligned, sig);
+    fn waveform_window_stable_across_frequencies_and_phases() {
+        let params = Params {
+            sensitivity: 1.0,
+            fall: 0.2,
+        };
+        // Frequencies whose period fits the allowed trigger range must
+        // always produce a full, triggered window.
+        for freq in [40.0, 50.0, 220.0, 440.0, 1000.0, 5000.0] {
+            for phase in [0.0f32, 1.1, 2.3, 4.2] {
+                let mut an = Analyzer::new(44_100, 64);
+                for i in 0..(FFT_SIZE * 4) {
+                    let t = i as f32 / 44_100.0;
+                    an.push_sample((2.0 * PI * freq * t + phase).sin() * 0.9);
+                }
+                let frame = an.tick(&params, true);
+                assert_eq!(
+                    frame.waveform.len(),
+                    WAVE_DISPLAY,
+                    "freq {freq} phase {phase}: fixed window"
+                );
+                assert!(
+                    frame.waveform[0] <= 0.0 && frame.waveform[1] > 0.0,
+                    "freq {freq} phase {phase}: must trigger"
+                );
+            }
+        }
+        // Sub-audio frequencies may fall back, but the window must stay
+        // full-length and never blank out.
+        for freq in [20.0, 25.0, 30.0] {
+            for phase in [0.0f32, 2.0] {
+                let mut an = Analyzer::new(44_100, 64);
+                for i in 0..(FFT_SIZE * 4) {
+                    let t = i as f32 / 44_100.0;
+                    an.push_sample((2.0 * PI * freq * t + phase).sin() * 0.9);
+                }
+                let frame = an.tick(&params, true);
+                assert_eq!(
+                    frame.waveform.len(),
+                    WAVE_DISPLAY,
+                    "freq {freq}: fallback window must stay full"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn waveform_window_short_history_and_dc() {
+        // Short history: return what exists.
+        let mut an = Analyzer::new(44_100, 64);
+        an.push_sample(0.5);
+        an.push_sample(-0.5);
+        let params = Params {
+            sensitivity: 1.0,
+            fall: 0.2,
+        };
+        let frame = an.tick(&params, true);
+        assert!(frame.waveform.len() <= 2, "history shorter than window");
+
+        // Constant positive signal (DC): no crossing, still a full window.
+        let mut an = Analyzer::new(44_100, 64);
+        for _ in 0..(FFT_SIZE * 2) {
+            an.push_sample(0.5);
+        }
+        let frame = an.tick(&params, true);
+        assert_eq!(frame.waveform.len(), WAVE_DISPLAY);
     }
 
     #[test]
