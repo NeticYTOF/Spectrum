@@ -31,23 +31,36 @@ pub fn sample_at(vals: &[f32], t: f32) -> f32 {
     vals[i] * (1.0 - f) + vals[j] * f
 }
 
-/// Map `bars` (band values) onto `n` screen columns.
-pub fn sample_bars(bars: &[f32], n: usize) -> Vec<f32> {
-    if n == 0 {
-        return Vec::new();
+/// Reusable per-render scratch space: keeps the 60 fps render path free
+/// of per-frame allocations.
+pub struct RenderScratch {
+    bars: Vec<f32>,
+    grid: Vec<u16>,
+}
+
+impl RenderScratch {
+    pub fn new() -> Self {
+        Self {
+            bars: Vec::new(),
+            grid: Vec::new(),
+        }
     }
-    (0..n)
-        .map(|i| {
-            sample_at(
-                bars,
-                if n == 1 {
-                    0.0
-                } else {
-                    i as f32 / (n - 1) as f32
-                },
-            )
-        })
-        .collect()
+}
+
+/// Map `bars` (band values) onto `n` screen columns, writing into `out`.
+pub fn fill_sample_bars(bars: &[f32], n: usize, out: &mut Vec<f32>) {
+    out.clear();
+    out.resize(n, 0.0);
+    for i in 0..n {
+        out[i] = sample_at(
+            bars,
+            if n == 1 {
+                0.0
+            } else {
+                i as f32 / (n - 1) as f32
+            },
+        );
+    }
 }
 
 fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, fg: Color) {
@@ -65,17 +78,19 @@ pub fn render_spectrum(
     bars: &[f32],
     theme: &Theme,
     peaks: &mut Vec<f32>,
+    scratch: &mut RenderScratch,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let w = area.width as usize;
     let h = area.height as usize;
-    let vals = sample_bars(bars, w);
+    fill_sample_bars(bars, w, &mut scratch.bars);
     if peaks.len() != w {
         peaks.clear();
         peaks.resize(w, 0.0);
     }
+    let vals = &scratch.bars;
 
     for x in 0..w {
         let v = vals[x].clamp(0.0, 1.0);
@@ -132,6 +147,7 @@ pub fn render_oscilloscope(
     waveform: &[f32],
     theme: &Theme,
     gain: f32,
+    scratch: &mut RenderScratch,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -144,7 +160,9 @@ pub fn render_oscilloscope(
     let sub_cols = w * 2;
     let sub_rows = h * 4;
 
-    let mut grid = vec![0u16; w * h];
+    let grid = &mut scratch.grid;
+    grid.resize(w * h, 0);
+    grid.fill(0);
     let last = waveform.len() - 1;
     let gain = gain.max(0.1);
 
@@ -243,7 +261,8 @@ mod tests {
     #[test]
     fn sample_bars_interpolates() {
         let bars = vec![0.0, 1.0];
-        let v = sample_bars(&bars, 5);
+        let mut v = Vec::new();
+        fill_sample_bars(&bars, 5, &mut v);
         assert_eq!(v.len(), 5);
         assert_eq!(v[0], 0.0);
         assert!((v[2] - 0.5).abs() < 1e-6);
@@ -254,14 +273,18 @@ mod tests {
     fn sample_at_handles_degenerate() {
         assert_eq!(sample_at(&[], 0.5), 0.0);
         assert_eq!(sample_at(&[0.7], 0.9), 0.7);
-        assert!(sample_bars(&[0.5], 0).is_empty());
-        assert_eq!(sample_bars(&[0.5], 1)[0], 0.5);
+        let mut v = Vec::new();
+        fill_sample_bars(&[0.5], 0, &mut v);
+        assert!(v.is_empty());
+        fill_sample_bars(&[0.5], 1, &mut v);
+        assert_eq!(v[0], 0.5);
     }
 
     #[test]
     fn renderers_tolerate_empty_and_tiny() {
         let theme = crate::theme::find("fire").unwrap();
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
+        let mut scratch = RenderScratch::new();
 
         // Zero-sized and near-empty inputs must not panic.
         render_spectrum(
@@ -270,6 +293,7 @@ mod tests {
             &[0.5],
             &theme,
             &mut Vec::new(),
+            &mut scratch,
         );
         render_spectrum(
             &mut buf,
@@ -277,14 +301,16 @@ mod tests {
             &[],
             &theme,
             &mut Vec::new(),
+            &mut scratch,
         );
-        render_oscilloscope(&mut buf, Rect::new(0, 0, 4, 3), &[], &theme, 1.0);
+        render_oscilloscope(&mut buf, Rect::new(0, 0, 4, 3), &[], &theme, 1.0, &mut scratch);
         render_oscilloscope(
             &mut buf,
             Rect::new(0, 0, 4, 3),
             &[0.0, 0.5, -0.5, 0.2],
             &theme,
             1.0,
+            &mut scratch,
         );
         let cols: VecDeque<Vec<f32>> = VecDeque::new();
         render_spectrogram(&mut buf, Rect::new(0, 0, 4, 3), &cols, &theme);
@@ -297,7 +323,8 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let bars = vec![1.0; 5];
         let mut peaks = Vec::new();
-        render_spectrum(&mut buf, area, &bars, &theme, &mut peaks);
+        let mut scratch = RenderScratch::new();
+        render_spectrum(&mut buf, area, &bars, &theme, &mut peaks, &mut scratch);
         // Full-height bars fill the bottom row entirely.
         let filled = (0..5)
             .filter(|&x| buf[(x as u16, 3)].symbol() == "\u{2588}")

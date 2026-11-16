@@ -68,6 +68,7 @@ pub struct App {
     peaks: Vec<f32>,
     gram: VecDeque<Vec<f32>>,
     gram_tick: u32,
+    scratch: visualizers::RenderScratch,
     themes: Vec<Theme>,
     theme_idx: usize,
 }
@@ -91,8 +92,9 @@ impl App {
             fall: state.params.fall,
             volume,
             peaks: Vec::new(),
-            gram: VecDeque::new(),
+            gram: VecDeque::with_capacity(520),
             gram_tick: 0,
+            scratch: visualizers::RenderScratch::new(),
             themes,
             theme_idx,
         }
@@ -255,11 +257,18 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
         return; // too small to render anything useful
     }
 
-    // Clone once per frame so all later `&mut app.*` borrows stay disjoint.
-    let theme = app.themes[app.theme_idx].clone();
-    let accent = theme.accent();
-    let beat_color = theme.beat();
-    let border = theme::lerp_color(accent, beat_color, app.beat_flash);
+    // Copy scalars first, then split-borrow the heavy fields: the theme is
+    // referenced (not cloned) while peaks/scratch stay mutable.
+    let mode = app.mode;
+    let theme_idx = app.theme_idx;
+    let beat_flash = app.beat_flash;
+    let help = app.help;
+
+    let accent = app.themes[theme_idx].accent();
+    let beat_color = app.themes[theme_idx].beat();
+    let border = theme::lerp_color(accent, beat_color, beat_flash);
+
+    let status = status_line(app, audio, accent, analysis.flux);
 
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
     let main = chunks[0];
@@ -267,10 +276,10 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
 
     let mut title_right = vec![
         Span::raw(" "),
-        Span::styled(app.mode.name(), Style::new().fg(accent)),
+        Span::styled(mode.name(), Style::new().fg(accent)),
         Span::raw(" "),
     ];
-    if app.beat_flash > 0.5 {
+    if beat_flash > 0.5 {
         title_right.push(Span::styled("\u{266A}", Style::new().fg(beat_color)));
     }
 
@@ -285,24 +294,38 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
     let inner = block.inner(main);
     f.render_widget(block, main);
 
-    match app.mode {
+    let App {
+        themes,
+        peaks,
+        gram,
+        scratch,
+        ..
+    } = app;
+    let theme = &themes[theme_idx];
+
+    match mode {
         Mode::Bars => visualizers::render_spectrum(
             f.buffer_mut(),
             inner,
             &analysis.bars,
-            &theme,
-            &mut app.peaks,
+            theme,
+            peaks,
+            scratch,
         ),
-        Mode::Scope => {
-            visualizers::render_oscilloscope(f.buffer_mut(), inner, &analysis.waveform, &theme, 0.9)
-        }
-        Mode::Gram => visualizers::render_spectrogram(f.buffer_mut(), inner, &app.gram, &theme),
+        Mode::Scope => visualizers::render_oscilloscope(
+            f.buffer_mut(),
+            inner,
+            &analysis.waveform,
+            theme,
+            0.9,
+            scratch,
+        ),
+        Mode::Gram => visualizers::render_spectrogram(f.buffer_mut(), inner, gram, theme),
     }
 
-    let status = status_line(app, audio, accent, analysis.flux);
     f.render_widget(Paragraph::new(status), status_area);
 
-    if app.help {
+    if help {
         let help_area = centered_rect(46, 15, area);
         f.render_widget(Clear, help_area);
         f.render_widget(
