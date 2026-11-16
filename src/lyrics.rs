@@ -333,6 +333,7 @@ fn fetch_record(agent: &ureq::Agent, url: &str) -> FetchOutcome {
 
 /// GET outcome: Ok(body) / NotFound (404) / RateLimited (429 beyond
 /// budget) / Failed(reason).
+#[derive(Debug)]
 enum FetchBody {
     Ok(String),
     NotFound,
@@ -551,10 +552,8 @@ mod tests {
     #[test]
     #[ignore = "live network test; run with --ignored live_lyrics"]
     fn live_lyrics_smoke() {
-        // A single live-network smoke test, run explicitly via
-        // `cargo test --lib -- --ignored live_lyrics --nocapture`.
-        // Uses a traditional/public-domain song to avoid fetching
-        // copyrighted lyrics for testing.
+        // One live check of both LRCLIB endpoints with a public-domain
+        // song (no copyrighted fetches). Structural validation only.
         let agent = build_agent();
         let url = format!(
             "{BASE_URL}/api/get?{}",
@@ -564,28 +563,39 @@ mod tests {
                 ("duration", "240"),
             ])
         );
-        let body = match fetch_json_with_429(&agent, &url) {
-            FetchBody::Ok(b) => b,
+        match fetch_json_with_429(&agent, &url) {
+            FetchBody::Ok(body) => {
+                let rec: LrclibRecord = serde_json::from_str(&body).expect("valid LRCLIB record");
+                eprintln!(
+                    "live /api/get record: {} - {} (duration {:?}, synced {})",
+                    rec.artist_name,
+                    rec.track_name,
+                    rec.duration,
+                    rec.synced_lyrics.is_some()
+                );
+            }
             FetchBody::NotFound => {
-                eprintln!("live lookup: not found (acceptable)");
-                return;
+                eprintln!("live /api/get: 404; engaging the search fallback");
+                let surl = format!(
+                    "{BASE_URL}/api/search?{}",
+                    build_query(&[
+                        ("artist_name", "Traditional"),
+                        ("track_name", "Amazing Grace"),
+                    ])
+                );
+                match fetch_json_with_429(&agent, &surl) {
+                    FetchBody::Ok(body) => {
+                        let recs: Vec<LrclibRecord> =
+                            serde_json::from_str(&body).expect("valid search array");
+                        eprintln!("live /api/search returned {} candidates", recs.len());
+                        // The search endpoint returning data at all is the
+                        // smoke pass; matching is validated by unit tests.
+                        assert!(!recs.is_empty());
+                    }
+                    other => eprintln!("live search: {other:?}"),
+                }
             }
-            FetchBody::RateLimited => {
-                eprintln!("rate limited; skipping");
-                return;
-            }
-            FetchBody::Failed(e) => {
-                eprintln!("live lookup failed (network): {e}");
-                return;
-            }
-        };
-        let rec: LrclibRecord = serde_json::from_str(&body).expect("valid LRCLIB record");
-        eprintln!(
-            "live record: {} - {} (duration {:?}, synced {})",
-            rec.artist_name,
-            rec.track_name,
-            rec.duration,
-            rec.synced_lyrics.is_some()
-        );
+            other => eprintln!("live lookup: {other:?}"),
+        }
     }
 }

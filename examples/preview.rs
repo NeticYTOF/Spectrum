@@ -133,6 +133,21 @@ fn render_mode(
             visualizers::render_oscilloscope(&mut buf, wave_area, &wave, theme, 0.9, scratch)
         }
         "mirror" => visualizers::render_mirror(&mut buf, area, &bars, theme, scratch),
+        "lyrics" => {
+            // The garden with the demo fixture (deterministic, frozen).
+            let lines = spectrum::demo::demo_lyric_lines();
+            let view = spectrum::garden::GardenView {
+                title: spectrum::demo::DEMO_TRACK_TITLE,
+                artist: spectrum::demo::DEMO_TRACK_ARTIST,
+                lines: Some((&lines, Some(2))),
+                plain: None,
+                state: spectrum::garden::GardenState::Synced,
+                energy: 0.5,
+                time_s: 3.6,
+                since_line_change: 2.0,
+            };
+            spectrum::garden::render_garden(&mut buf, area, &view);
+        }
         _ => unreachable!(),
     }
     buf
@@ -143,7 +158,14 @@ fn main() {
 
     println!("SPECTRUM visual preview (dots = empty cells)\n");
 
-    let modes = ["spectrum", "oscilloscope", "spectrogram", "combo", "mirror"];
+    let modes = [
+        "spectrum",
+        "oscilloscope",
+        "spectrogram",
+        "combo",
+        "mirror",
+        "lyrics",
+    ];
 
     for &mode in &modes {
         // Normal terminal size.

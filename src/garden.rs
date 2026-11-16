@@ -164,12 +164,13 @@ fn glyph(c: char) -> Option<[u8; 5]> {
 }
 
 /// Total dot-matrix width of a text (sub-pixels), or None if any glyph
-/// is unsupported (caller falls back to normal text).
+/// is unsupported (caller falls back to normal text). Lowercase maps to
+/// its uppercase glyph, standard for dot-matrix fonts.
 fn matrix_width(text: &str) -> Option<usize> {
     let mut w = 0usize;
     let mut count = 0usize;
     for c in text.chars() {
-        glyph(c)?;
+        glyph(to_matrix_char(c))?;
         w += 4; // 3 columns + 1 spacing
         count += 1;
     }
@@ -179,11 +180,20 @@ fn matrix_width(text: &str) -> Option<usize> {
     Some(w - 1) // no trailing space
 }
 
+/// Lowercase letters use their uppercase dot-matrix glyph.
+fn to_matrix_char(c: char) -> char {
+    if c.is_ascii_lowercase() {
+        c.to_ascii_uppercase()
+    } else {
+        c
+    }
+}
+
 /// Draw dot-matrix text at (x0, y0) as In-layer dots. Returns the width.
 fn draw_matrix(canvas: &mut DotCanvas, text: &str, x0: i32, y0: i32, grow: f32) {
     let mut x = x0;
     for (i, c) in text.chars().enumerate() {
-        let g = glyph(c).unwrap_or([0; 5]);
+        let g = glyph(to_matrix_char(c)).unwrap_or([0; 5]);
         // Stagger the letters' growth like ascii-garden's typed reveal.
         let letter_grow = spr(grow * 2.0 - i as f32 * 0.06, 6.0, 12.0);
         for (row, bits) in g.iter().enumerate() {

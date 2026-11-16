@@ -64,25 +64,42 @@ fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, fg: Color) {
 /// Peak-cap fall speed, in fraction of the bar area per second.
 const PEAK_FALL_PER_SEC: f32 = 1.2;
 
-/// Shade cells from sparse to solid: blank, light, medium, dark, full.
-const SHADES: [char; 5] = [' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2588}'];
+/// Sub-cell halftone via explicit Braille dot occupancy (the reviewer
+/// confirmed VTE renders U+2591-93 as flat rectangles, but Braille as
+/// real dots). Coverage 0..=1 fills the 8 dots of the cell in a stable,
+/// spread-out order so every density level looks like an ordered stipple,
+/// with the same 4x4 Bayer threshold dithering fractional levels across
+/// cells. A pure function of (coverage, x, y): no temporal noise.
+///
+/// Fill order chosen so partial densities form even halftone screens:
+/// 1 dot = mid-left, 2 = opposite corners, 4 = checkerboard, 8 = solid.
+const DOT_FILL_ORDER: [(usize, usize); 8] = [
+    (0, 1), // dot 2 (mid-left)
+    (1, 2), // dot 6 (lower-right)
+    (0, 0), // dot 1 (top-left)
+    (1, 1), // dot 5 (mid-right)
+    (0, 2), // dot 3 (lower-left)
+    (1, 0), // dot 4 (top-right)
+    (1, 3), // dot 8 (bottom-right)
+    (0, 3), // dot 7 (bottom-left)
+];
 
-/// Sub-cell halftone: map a coverage in 0..=1 to a shade glyph, ordered-
-/// dithered between density levels by the same 4x4 Bayer pattern the
-/// color dithering uses. A pure function of (coverage, x, y): temporally
-/// stable, no per-frame noise, and together with the terminal's own dot
-/// structure inside \u{2591..2593} this yields a fine stipple instead of
-/// full-cell color checks.
-fn shade_glyph(coverage: f32, x: u16, y: u16) -> char {
-    let c = coverage.clamp(0.0, 1.0) * 4.0;
-    let base = c.floor();
-    let frac = c - base;
-    let up = if frac > crate::theme::bayer_threshold(x, y) {
-        1.0
-    } else {
-        0.0
-    };
-    SHADES[((base + up) as usize).min(4)]
+fn braille_density_char(coverage: f32, x: u16, y: u16) -> char {
+    let c = coverage.clamp(0.0, 1.0) * 8.0;
+    let base = (c.floor() as usize).min(8);
+    let frac = c - (base as f32);
+    let mut dots = base;
+    if frac > crate::theme::bayer_threshold(x, y) && base < 8 {
+        dots += 1;
+    }
+    let mut bits = 0u16;
+    for &(col, row) in DOT_FILL_ORDER.iter().take(dots.min(8)) {
+        bits |= braille_bit(col, row);
+    }
+    if bits == 0 {
+        return ' '; // a real blank, not the braille blank
+    }
+    char::from_u32(0x2800 + bits as u32).unwrap_or(' ')
 }
 
 /// Halftone color for a bar body cell: the gradient at a floored
@@ -137,9 +154,10 @@ pub fn render_spectrum(
             let y = area.y + (h - 1 - j) as u16;
             let t = (j + 1) as f32 / h as f32;
             let x = area.x + x as u16;
-            // Halftone body: ordered-dithered shade glyph (fine stipple)
-            // with the gradient color at a floored intensity.
-            let glyph = shade_glyph(body_coverage(t), x, y);
+            // Halftone body: ordered-dithered Braille dot occupancy (a
+            // portable, genuinely-dotted stipple) with the gradient color
+            // at a floored intensity.
+            let glyph = braille_density_char(body_coverage(t), x, y);
             put(buf, x, y, glyph, theme.at_dither(body_color_t(t), x, y));
         }
         if full < h && frac > 0.06 {
@@ -274,7 +292,7 @@ pub fn render_mirror(
         for j in 0..full.min(half) {
             let y = area.y + (half - 1 - j) as u16;
             let t = (j + 1) as f32 / half as f32;
-            let glyph = shade_glyph(body_coverage(t), sx, y);
+            let glyph = braille_density_char(body_coverage(t), sx, y);
             put(buf, sx, y, glyph, theme.at_dither(body_color_t(t), sx, y));
         }
         if full < half && frac > 0.06 {
@@ -290,7 +308,7 @@ pub fn render_mirror(
         for j in 0..full.min(bottom) {
             let y = area.y + (half + j) as u16;
             let t = (j + 1) as f32 / half as f32;
-            let glyph = shade_glyph(body_coverage(t), sx, y);
+            let glyph = braille_density_char(body_coverage(t), sx, y);
             put(buf, sx, y, glyph, theme.at_dither(body_color_t(t), sx, y));
         }
         if full < bottom && frac > 0.5 {
@@ -463,10 +481,11 @@ mod tests {
         let mut scratch = RenderScratch::new();
         render_mirror(&mut buf, area, &bars, &theme, &mut scratch);
 
-        // Full-height bars: the outermost rows of each half are solid;
-        // center-adjacent rows are airy halftone but never blank.
-        assert_eq!(buf[(0, 0)].symbol(), "\u{2588}", "outer top is solid");
-        assert_eq!(buf[(0, 5)].symbol(), "\u{2588}", "outer bottom is solid");
+        // Full-height bars: the outermost rows of each half are the
+        // all-dots braille; center-adjacent rows are airy halftone but
+        // never blank.
+        assert_eq!(buf[(0, 0)].symbol(), "\u{28FF}", "outer top is dense");
+        assert_eq!(buf[(0, 5)].symbol(), "\u{28FF}", "outer bottom is dense");
         for y in 1..5 {
             assert_ne!(
                 buf[(0, y)].symbol(),
@@ -475,7 +494,7 @@ mod tests {
             );
         }
         assert!(
-            (1..5).any(|y| buf[(0, y)].symbol() != "\u{2588}"),
+            (1..5).any(|y| buf[(0, y)].symbol() != "\u{28FF}"),
             "halftone density must vary across the halves"
         );
     }
@@ -559,12 +578,12 @@ mod tests {
         let mut peaks = Vec::new();
         let mut scratch = RenderScratch::new();
         render_spectrum(&mut buf, area, &bars, &theme, &mut peaks, &mut scratch, DT);
-        // Full-height bars: the top row is solid, lower rows are airy
-        // halftone but never blank.
+        // Full-height bars: the top row is the all-dots braille, lower
+        // rows are airy halftone but never blank.
         let solid = (0..5)
-            .filter(|&x| buf[(x as u16, 0)].symbol() == "\u{2588}")
+            .filter(|&x| buf[(x as u16, 0)].symbol() == "\u{28FF}")
             .count();
-        assert_eq!(solid, 5, "top row should be full blocks");
+        assert_eq!(solid, 5, "top row should be all-dots braille");
         for y in 1..4 {
             for x in 0..5u16 {
                 assert_ne!(buf[(x, y)].symbol(), " ", "body cell must never be blank");
@@ -573,18 +592,29 @@ mod tests {
     }
 
     #[test]
-    fn shade_glyph_is_deterministic_and_graduated() {
+    fn braille_density_is_deterministic_and_graduated() {
         // Pure function of (coverage, x, y): identical repeated calls.
         for y in 0..6u16 {
             for x in 0..6u16 {
-                assert_eq!(shade_glyph(0.6, x, y), shade_glyph(0.6, x, y));
+                assert_eq!(
+                    braille_density_char(0.6, x, y),
+                    braille_density_char(0.6, x, y)
+                );
             }
         }
-        // Extremes: 0 -> blank, 1 -> solid everywhere.
+        // Extremes: 0 -> blank cell, 1 -> the all-dots braille (U+28FF).
         for y in 0..4u16 {
             for x in 0..4u16 {
-                assert_eq!(shade_glyph(0.0, x, y), ' ');
-                assert_eq!(shade_glyph(1.0, x, y), '\u{2588}');
+                assert_eq!(braille_density_char(0.0, x, y), ' ');
+                assert_eq!(braille_density_char(1.0, x, y), '\u{28FF}');
+            }
+        }
+        // Always a braille glyph (portable dots, never a flat shade
+        // block) for body coverages.
+        for y in 0..4u16 {
+            for x in 0..4u16 {
+                let ch = braille_density_char(body_coverage(0.3), x, y);
+                assert!('\u{2800}' < ch && ch <= '\u{28FF}', "got {ch:?}");
             }
         }
         // Ordered stipple: a mid coverage produces more than one density
@@ -592,7 +622,7 @@ mod tests {
         let mut levels = std::collections::HashSet::new();
         for y in 0..4u16 {
             for x in 0..4u16 {
-                levels.insert(shade_glyph(0.55, x, y));
+                levels.insert(braille_density_char(0.55, x, y));
             }
         }
         assert!(levels.len() >= 2, "no stipple: {levels:?}");
