@@ -931,7 +931,7 @@ mod tests {
         assert!(record_matches(&ka, &y));
 
         // The album filter picks X out of an otherwise-identical pair.
-        let matches = vec![&x, &y];
+        let matches = [&x, &y];
         let by_album: Vec<&&LrclibRecord> = matches
             .iter()
             .filter(|r| match r.album_name.as_deref() {
