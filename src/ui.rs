@@ -784,6 +784,69 @@ mod tests {
         line.spans.iter().flat_map(|s| s.content.chars()).collect()
     }
 
+    /// Full-path regression: the demo seeding main.rs performs must pass
+    /// the REAL identity gate in render_lyrics (it used to leave the
+    /// lyrics key None, so the CLI showed "looking for lyrics..." forever).
+    #[test]
+    fn demo_seed_passes_identity_gate_and_renders_garden() {
+        let media = crate::media::new_shared();
+        let lyrics = crate::lyrics::new_shared();
+        demo::seed_demo_state(&media, &lyrics, 4.5, true);
+        let analysis = FrameAnalysis::quiet(64);
+        for (w, h) in [(144u16, 42u16), (100, 30), (72, 22)] {
+            let mut app = demo_app();
+            let area = ratatui::layout::Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            render_lyrics(&mut buf, area, &mut app, &analysis, &media, &lyrics, 0.016);
+            let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+            assert!(
+                !text.contains("looking for lyrics"),
+                "{w}x{h}: stuck in Loading"
+            );
+            let mut ink = 0;
+            let mut stem = 0;
+            let mut flower = 0;
+            for c in buf.content() {
+                match c.fg {
+                    Color::Rgb(26, 26, 26) => ink += 1,
+                    Color::Rgb(28, 43, 143) => stem += 1,
+                    Color::Rgb(232, 61, 95) => flower += 1,
+                    _ => {}
+                }
+            }
+            assert!(ink > 0, "{w}x{h}: no lyric ink drawn");
+            assert!(stem > 0, "{w}x{h}: no stems drawn");
+            assert!(flower > 0, "{w}x{h}: no flowers drawn");
+        }
+    }
+
+    /// The gate itself must stay strict: a real track change with no
+    /// matching lyrics state still shows Loading, never stale fixture words.
+    #[test]
+    fn identity_gate_still_blocks_mismatched_state() {
+        let media = crate::media::new_shared();
+        let lyrics = crate::lyrics::new_shared();
+        demo::seed_demo_state(&media, &lyrics, 4.5, true);
+        {
+            let mut m = media.lock().unwrap();
+            m.title = "Some Other Song".into();
+        }
+        let mut app = demo_app();
+        let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        render_lyrics(
+            &mut buf,
+            area,
+            &mut app,
+            &FrameAnalysis::quiet(64),
+            &media,
+            &lyrics,
+            0.016,
+        );
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("looking for lyrics"), "gate relaxed");
+    }
+
     #[test]
     fn status_fits_every_width() {
         let app = demo_app();

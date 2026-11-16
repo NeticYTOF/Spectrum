@@ -56,6 +56,25 @@ pub fn demo_snapshot(pos: f64, paused: bool) -> crate::media::MediaSnapshot {
     }
 }
 
+/// Seed the media + lyrics shared state for the demo BEFORE the UI starts.
+/// The fixture's media identity and lyrics identity are derived from the
+/// same snapshot, so the UI's real-track identity gate passes honestly
+/// (the gate itself is untouched).
+pub fn seed_demo_state(
+    media: &crate::media::MediaShared,
+    lyrics: &crate::lyrics::LyricsShared,
+    pos: f64,
+    paused: bool,
+) {
+    let snap = demo_snapshot(pos, paused);
+    let key = crate::lyrics::TrackKey::from_snapshot(&snap);
+    *media.lock().unwrap_or_else(|e| e.into_inner()) = snap;
+    let mut st = lyrics.lock().unwrap_or_else(|e| e.into_inner());
+    st.key = key;
+    st.generation = st.generation.wrapping_add(1);
+    st.status = crate::lyrics::LyricsStatus::Synced(demo_lyric_lines());
+}
+
 /// A demo "media session" thread: publishes the synthetic timeline so the
 /// lyrics garden works identically without any real player. With
 /// `freeze_at`, the position is pinned for deterministic frames.

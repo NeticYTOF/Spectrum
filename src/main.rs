@@ -148,16 +148,20 @@ fn main() -> Result<()> {
             args.freeze_at,
         );
         worker_threads.push(demo_thread);
+        // The demo fixture's lyrics ship locally (no network, no
+        // copyrighted content). Media + lyrics identities are seeded
+        // together BEFORE the UI and the media thread start, so the
+        // first rendered frame already has a matching identity.
+        demo::seed_demo_state(
+            &media_shared,
+            &lyrics_shared,
+            args.freeze_at.map(|f| f as f64).unwrap_or(0.0),
+            args.freeze_at.is_some(),
+        );
         let pause = handle.demo_pause.clone().unwrap();
         let media_thread =
             demo::spawn_demo_media(media_shared.clone(), stop.clone(), pause, args.freeze_at);
         worker_threads.push(media_thread);
-        // The demo fixture's lyrics ship locally (no network, no
-        // copyrighted content): seed the lyrics state directly.
-        {
-            let mut st = lyrics_shared.lock().unwrap();
-            st.status = spectrum::lyrics::LyricsStatus::Synced(demo::demo_lyric_lines());
-        }
         let r = ui::run(spectrum::ui::RunConfig {
             shared: &shared,
             audio: &handle,
