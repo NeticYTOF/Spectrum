@@ -130,18 +130,79 @@ fn nearest_xterm(rgb: [u8; 3]) -> u8 {
     best as u8
 }
 
-/// Nearest ANSI-16 palette index for an RGB color.
+/// Nearest ANSI-16 palette index for an RGB color. With only 16 entries
+/// plain RGB distance throws hue away (a mid blue lands on gray), so this
+/// uses the perceptual "redmean" distance and penalises mapping a
+/// saturated colour onto a neutral entry: blue stays blue, red stays red.
 fn nearest_ansi16(rgb: [u8; 3]) -> u8 {
+    let sat = |c: [u8; 3]| {
+        let mx = c.iter().copied().max().unwrap_or(0) as f32;
+        let mn = c.iter().copied().min().unwrap_or(0) as f32;
+        if mx <= 0.0 {
+            0.0
+        } else {
+            (mx - mn) / mx
+        }
+    };
+    let s = sat(rgb);
     let mut best = 0usize;
     let mut best_d = f32::INFINITY;
     for (i, cand) in ANSI16_RGB.iter().enumerate() {
-        let d = dist2(rgb, *cand);
+        let rmean = (rgb[0] as f32 + cand[0] as f32) / 2.0;
+        let dr = rgb[0] as f32 - cand[0] as f32;
+        let dg = rgb[1] as f32 - cand[1] as f32;
+        let db = rgb[2] as f32 - cand[2] as f32;
+        let mut d = (2.0 + rmean / 256.0) * dr * dr
+            + 4.0 * dg * dg
+            + (2.0 + (255.0 - rmean) / 256.0) * db * db;
+        if s > 0.3 && sat(*cand) < 0.05 {
+            d *= 1.0 + 2.5 * s;
+        }
         if d < best_d {
             best_d = d;
             best = i;
         }
     }
     best as u8
+}
+
+/// Map any RGB colour to the selected depth (indexed colours pass
+/// through). Truecolor is the identity.
+pub fn quantize_color(c: Color, depth: ColorDepth) -> Color {
+    let Color::Rgb(r, g, b) = c else { return c };
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<(u8, u8, u8, u8), u8>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let tag = match depth {
+        ColorDepth::True => return c,
+        ColorDepth::P256 => 1u8,
+        ColorDepth::Ansi16 => 2u8,
+    };
+    let idx = CACHE.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() > 4096 {
+            m.clear();
+        }
+        *m.entry((tag, r, g, b)).or_insert_with(|| match depth {
+            ColorDepth::P256 => nearest_xterm([r, g, b]),
+            _ => nearest_ansi16([r, g, b]),
+        })
+    });
+    Color::Indexed(idx)
+}
+
+/// Quantize every RGB fg/bg in `buf` to `depth`: one coherent final pass,
+/// so chrome, garden paper and lerped glows follow the selected palette
+/// exactly like the theme gradients do.
+pub fn quantize_buffer(buf: &mut ratatui::buffer::Buffer, depth: ColorDepth) {
+    if depth == ColorDepth::True {
+        return;
+    }
+    for cell in buf.content.iter_mut() {
+        cell.fg = quantize_color(cell.fg, depth);
+        cell.bg = quantize_color(cell.bg, depth);
+    }
 }
 
 #[derive(Clone)]
@@ -400,6 +461,46 @@ mod tests {
         // A genuinely neutral dark gray maps into the ramp (>= 232).
         assert_eq!(nearest_xterm([10, 10, 10]), 232);
         assert_eq!(nearest_xterm([139, 139, 139]), 245);
+    }
+
+    #[test]
+    fn quantize_buffer_leaves_no_truecolor_and_keeps_hue() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf[(0, 0)].set_fg(Color::Rgb(71, 82, 160)); // garden stem fill
+        buf[(1, 0)].set_fg(Color::Rgb(253, 95, 70)); // rose fill
+        buf[(2, 0)].set_bg(Color::Rgb(243, 238, 228)); // paper
+        for depth in [ColorDepth::P256, ColorDepth::Ansi16] {
+            let mut b = buf.clone();
+            quantize_buffer(&mut b, depth);
+            assert!(
+                b.content()
+                    .iter()
+                    .all(|c| !matches!(c.fg, Color::Rgb(..)) && !matches!(c.bg, Color::Rgb(..))),
+                "{depth:?} left truecolor behind"
+            );
+        }
+        // In 16 colours the stem blue must stay chromatic (not gray 7/8),
+        // the rose red, and the paper white-ish.
+        let mut b = buf.clone();
+        quantize_buffer(&mut b, ColorDepth::Ansi16);
+        assert!(!matches!(
+            b[(0, 0)].fg,
+            Color::Indexed(7) | Color::Indexed(8)
+        ));
+        assert!(matches!(
+            b[(1, 0)].fg,
+            Color::Indexed(9) | Color::Indexed(1)
+        ));
+        assert!(matches!(
+            b[(2, 0)].bg,
+            Color::Indexed(15) | Color::Indexed(7)
+        ));
+        // Truecolor is untouched.
+        let mut t = buf.clone();
+        quantize_buffer(&mut t, ColorDepth::True);
+        assert_eq!(t.content(), buf.content());
     }
 
     #[test]

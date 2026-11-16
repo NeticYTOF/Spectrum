@@ -580,20 +580,29 @@ fn draw(
         Paragraph::new(status).style(Style::new().bg(status_bg)),
         status_area,
     );
+    let depth = app.depth;
 
     if help {
-        let help_area = centered_rect(46, 15, area);
+        // A quiet card: dark panel, rounded hairline border in the accent.
+        let help_area = centered_rect(64, 15, area);
+        let panel = Color::Rgb(16, 17, 24);
         f.render_widget(Clear, help_area);
         f.render_widget(
-            Paragraph::new(help_text(accent)).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().fg(accent))
-                    .title(" Help "),
-            ),
+            Paragraph::new(help_text(accent))
+                .style(Style::new().bg(panel))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(ratatui::widgets::BorderType::Rounded)
+                        .border_style(Style::new().fg(accent).bg(panel))
+                        .title(" keys "),
+                ),
             help_area,
         );
     }
+
+    // Every colour on screen follows the selected depth.
+    theme::quantize_buffer(f.buffer_mut(), depth);
 }
 
 /// Build the status bar for a given width. Sections are ordered by
@@ -1330,6 +1339,44 @@ mod tests {
             assert!(text.contains("DEMO"), "mode {mode} lost the DEMO label");
             let drawn = buf.content().iter().filter(|c| c.symbol() != " ").count();
             assert!(drawn > 60, "mode {mode} drew only {drawn} cells");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn motion_probe() {
+        // Frame-to-frame change rate per mode (live, 60 fps): flicker or
+        // jitter shows up as a high rate of cells changing between two
+        // consecutive frames. Prints; run with --ignored --nocapture.
+        for mode in 1..=6u8 {
+            let snap = |at: f32| {
+                snapshot(&Snapshot {
+                    mode,
+                    theme: "spectrum",
+                    depth: ColorDepth::True,
+                    at,
+                    frozen: false,
+                    warmup: 1.5,
+                    lyric: None,
+                    width: 100,
+                    height: 30,
+                })
+            };
+            for at in [2.0f32, 4.5, 6.8, 7.9] {
+                let a = snap(at);
+                let b = snap(at + 1.0 / 60.0);
+                let changed = a
+                    .content()
+                    .iter()
+                    .zip(b.content().iter())
+                    .filter(|(x, y)| x != y)
+                    .count();
+                let lit = a.content().iter().filter(|c| c.symbol() != " ").count();
+                println!(
+                    "mode {mode} t={at:.2}: changed {changed:4} of {} cells (lit {lit})",
+                    a.content().len()
+                );
+            }
         }
     }
 
