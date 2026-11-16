@@ -99,6 +99,9 @@ pub struct AudioHandle {
     pub meta: Arc<Mutex<AudioMeta>>,
     pub sink: Option<Sink>,
     capture: Option<Arc<Mutex<CaptureShared>>>,
+    /// Live capture sample rate; updated by the owner when the device
+    /// changes so the analyzer can remap its FFT frequency geometry.
+    pub rate_watch: Arc<std::sync::atomic::AtomicU32>,
     /// Must outlive `sink`; dropping it stops all playback.
     _output: Option<OutputStream>,
     /// Demo mode: no audio hardware is touched at all.
@@ -185,6 +188,7 @@ impl AudioHandle {
             })),
             sink: None,
             capture: None,
+            rate_watch: Arc::new(std::sync::atomic::AtomicU32::new(44_100)),
             _output: None,
             demo: true,
             demo_pause: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
@@ -372,6 +376,7 @@ pub fn start_file(path: &Path, queue: SampleQueue) -> Result<AudioHandle> {
         })),
         sink: Some(sink),
         capture: None,
+        rate_watch: Arc::new(std::sync::atomic::AtomicU32::new(sample_rate)),
         _output: Some(stream),
         demo: false,
         demo_pause: None,
@@ -404,6 +409,7 @@ fn build_stream<T>(
     config: &cpal::StreamConfig,
     queue: SampleQueue,
     channels: u16,
+    err_slot: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream>
 where
     T: cpal::SizedSample + IntoF32,
@@ -434,9 +440,11 @@ where
             }
             push_samples(&queue, &batch);
         },
-        |_err| {
-            // Capture glitches are non-fatal; the analyzer just sees
-            // silence until the stream recovers.
+        move |err| {
+            // Surface stream failures instead of discarding them; the
+            // owner thread picks this up within a second and reacts.
+            let mut slot = err_slot.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(format!("{err}"));
         },
         None,
     )?;
@@ -456,7 +464,7 @@ fn open_capture_stream(
     device: &cpal::Device,
     queue: SampleQueue,
     loopback: bool,
-) -> Result<(cpal::Stream, u32)> {
+) -> Result<BuiltStream> {
     let supported = if loopback {
         device.default_output_config()
     } else {
@@ -470,27 +478,52 @@ fn open_capture_stream(
     let channels = supported.channels();
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
+    let err_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    let stream = match sample_format {
-        cpal::SampleFormat::F32 => build_stream::<f32>(device, &config, queue, channels)?,
-        cpal::SampleFormat::I16 => build_stream::<i16>(device, &config, queue, channels)?,
-        cpal::SampleFormat::U16 => build_stream::<u16>(device, &config, queue, channels)?,
-        cpal::SampleFormat::I8 => build_stream::<i8>(device, &config, queue, channels)?,
-        cpal::SampleFormat::U8 => build_stream::<u8>(device, &config, queue, channels)?,
-        cpal::SampleFormat::I32 => build_stream::<i32>(device, &config, queue, channels)?,
-        cpal::SampleFormat::U32 => build_stream::<u32>(device, &config, queue, channels)?,
-        cpal::SampleFormat::I64 => build_stream::<i64>(device, &config, queue, channels)?,
-        cpal::SampleFormat::U64 => build_stream::<u64>(device, &config, queue, channels)?,
-        other => bail!("unsupported capture sample format: {other:?}"),
+    let stream = {
+        let slot = err_slot.clone();
+        match sample_format {
+            cpal::SampleFormat::F32 => build_stream::<f32>(device, &config, queue, channels, slot)?,
+            cpal::SampleFormat::I16 => build_stream::<i16>(device, &config, queue, channels, slot)?,
+            cpal::SampleFormat::U16 => build_stream::<u16>(device, &config, queue, channels, slot)?,
+            cpal::SampleFormat::I8 => build_stream::<i8>(device, &config, queue, channels, slot)?,
+            cpal::SampleFormat::U8 => build_stream::<u8>(device, &config, queue, channels, slot)?,
+            cpal::SampleFormat::I32 => build_stream::<i32>(device, &config, queue, channels, slot)?,
+            cpal::SampleFormat::U32 => build_stream::<u32>(device, &config, queue, channels, slot)?,
+            cpal::SampleFormat::I64 => build_stream::<i64>(device, &config, queue, channels, slot)?,
+            cpal::SampleFormat::U64 => build_stream::<u64>(device, &config, queue, channels, slot)?,
+            other => bail!("unsupported capture sample format: {other:?}"),
+        }
     };
-    Ok((stream, sample_rate))
+    Ok(BuiltStream {
+        stream,
+        sample_rate,
+        err_slot,
+    })
 }
 
-fn describe(source: CaptureSource, device_name: &str, status: &str) -> String {
-    format!(
-        "{source} \u{b7} {device_name} \u{b7} {status}",
-        source = source.name()
-    )
+fn describe(source: CaptureSource, device_name: &str) -> String {
+    format!("{source} \u{b7} {device_name}", source = source.name())
+}
+
+/// A freshly built capture stream plus its error slot. The cpal error
+/// callback records the latest stream failure into the slot so the owner
+/// thread can surface and react to it; the slot travels with the stream
+/// and is replaced on every rebuild.
+struct BuiltStream {
+    stream: cpal::Stream,
+    sample_rate: u32,
+    err_slot: Arc<Mutex<Option<String>>>,
+}
+
+impl BuiltStream {
+    /// Take the latest stream error, if any (clearing the slot).
+    fn take_error(&self) -> Option<String> {
+        self.err_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
 }
 
 /// Capture live audio from an explicitly chosen source. No silent
@@ -515,6 +548,7 @@ pub fn start_capture(queue: SampleQueue, source: CaptureSource) -> Result<AudioH
         description: String::new(),
         status: "starting",
     }));
+    let rate_watch = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (init_tx, init_rx) = mpsc::channel::<Result<(String, u32), String>>();
 
     std::thread::Builder::new()
@@ -522,7 +556,8 @@ pub fn start_capture(queue: SampleQueue, source: CaptureSource) -> Result<AudioH
         .spawn({
             let capture = capture.clone();
             let meta = meta.clone();
-            move || capture_owner_loop(source, queue, cmd_rx, capture, meta, init_tx)
+            let rate_watch = rate_watch.clone();
+            move || capture_owner_loop(source, queue, cmd_rx, capture, meta, rate_watch, init_tx)
         })
         .context("failed to spawn the capture thread")?;
 
@@ -548,7 +583,7 @@ pub fn start_capture(queue: SampleQueue, source: CaptureSource) -> Result<AudioH
     {
         let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
         m.sample_rate = sample_rate;
-        m.description = describe(source, &device_name, "live");
+        m.description = describe(source, &device_name);
         m.status = "live";
     }
 
@@ -556,6 +591,7 @@ pub fn start_capture(queue: SampleQueue, source: CaptureSource) -> Result<AudioH
         meta,
         sink: None,
         capture: Some(capture),
+        rate_watch,
         _output: None,
         demo: false,
         demo_pause: None,
@@ -565,14 +601,18 @@ pub fn start_capture(queue: SampleQueue, source: CaptureSource) -> Result<AudioH
 /// The capture owner thread body: resolves the initial device, builds the
 /// stream, then serves pause/play commands and re-checks the default
 /// output device about once a second (system capture only), rebuilding the
-/// loopback stream on change. Exits when the command channel closes (the
-/// `AudioHandle` was dropped), dropping the stream and stopping capture.
+/// loopback stream on change. Stream errors from the cpal callback are
+/// surfaced and trigger a rebuild attempt; pause/play failures are
+/// reported honestly via meta instead of being swallowed. Exits when the
+/// command channel closes (the `AudioHandle` was dropped), dropping the
+/// stream and stopping capture.
 fn capture_owner_loop(
     source: CaptureSource,
     queue: SampleQueue,
     cmd_rx: Receiver<CapCmd>,
     shared: Arc<Mutex<CaptureShared>>,
     meta: Arc<Mutex<AudioMeta>>,
+    rate_watch: Arc<std::sync::atomic::AtomicU32>,
     init_tx: Sender<Result<(String, u32), String>>,
 ) {
     use cpal::traits::DeviceTrait;
@@ -600,14 +640,15 @@ fn capture_owner_loop(
             }
         })
         .unwrap_or_else(|_| "default device".into());
-    let mut stream = match open_capture_stream(&device, queue.clone(), loopback) {
-        Ok((s, rate)) => {
+    let mut current = match open_capture_stream(&device, queue.clone(), loopback) {
+        Ok(built) => {
             {
                 let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
                 sh.device_name = device_name.clone();
             }
-            let _ = init_tx.send(Ok((device_name.clone(), rate)));
-            s
+            rate_watch.store(built.sample_rate, std::sync::atomic::Ordering::Relaxed);
+            let _ = init_tx.send(Ok((device_name.clone(), built.sample_rate)));
+            built
         }
         Err(err) => {
             let _ = init_tx.send(Err(format!(
@@ -618,17 +659,70 @@ fn capture_owner_loop(
         }
     };
 
+    // Rebuild on a fresh device, carrying the pause state; report the
+    // outcome honestly. Returns the new stream bundle on success.
+    macro_rules! rebuild_on {
+        ($device:expr, $reason:expr) => {{
+            let paused = shared.lock().unwrap_or_else(|e| e.into_inner()).paused;
+            match open_capture_stream(&$device, queue.clone(), loopback) {
+                Ok(built) => {
+                    if paused {
+                        if let Err(e) = built.stream.pause() {
+                            record_control_error(&meta, source, format!("pause failed: {e}"));
+                        }
+                    }
+                    rate_watch.store(built.sample_rate, std::sync::atomic::Ordering::Relaxed);
+                    let name = $device.name().unwrap_or_else(|_| "default device".into());
+                    device_name = name.clone();
+                    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    sh.device_name = name.clone();
+                    sh.last_error = None;
+                    let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
+                    m.sample_rate = built.sample_rate;
+                    m.description = describe(source, &name);
+                    m.status = "live";
+                    current = built;
+                }
+                Err(err) => {
+                    let detail = format!("{err:#}");
+                    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    sh.last_error = Some(detail.clone());
+                    let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
+                    m.description = format!("{} \u{b7} reconnecting ({detail})", source.name());
+                    m.status = "reconnecting";
+                }
+            }
+        }};
+    }
+
     let mut last_check = std::time::Instant::now();
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(CapCmd::Pause) => {
-                let _ = stream.pause();
+                if let Err(e) = current.stream.pause() {
+                    record_control_error(&meta, source, format!("pause failed: {e}"));
+                }
             }
             Ok(CapCmd::Play) => {
-                let _ = stream.play();
+                if let Err(e) = current.stream.play() {
+                    record_control_error(&meta, source, format!("resume failed: {e}"));
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        // Surface any stream error reported by the cpal callback and
+        // attempt a rebuild on the current default device.
+        if let Some(err) = current.take_error() {
+            let detail = format!("stream error: {err}");
+            let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
+            m.description = format!("{} \u{b7} reconnecting ({detail})", source.name());
+            m.status = "reconnecting";
+            drop(m);
+            if let Some(device) = resolve_device(source) {
+                rebuild_on!(device, detail);
+            }
         }
 
         // Re-check the default output device about once a second.
@@ -640,6 +734,12 @@ fn capture_owner_loop(
         last_check = std::time::Instant::now();
 
         let Some(new_device) = resolve_device(source) else {
+            // No output device at all: say so instead of pretending live.
+            let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
+            if m.status != "reconnecting" {
+                m.description = format!("{} \u{b7} reconnecting (no output device)", source.name());
+                m.status = "reconnecting";
+            }
             continue;
         };
         let Ok(new_name) = new_device.name() else {
@@ -650,34 +750,17 @@ fn capture_owner_loop(
         }
         // The default output changed: rebuild the loopback stream on it,
         // carrying the pause state over.
-        let paused = shared.lock().unwrap_or_else(|e| e.into_inner()).paused;
-        match open_capture_stream(&new_device, queue.clone(), true) {
-            Ok((new_stream, rate)) => {
-                if paused {
-                    let _ = new_stream.pause();
-                }
-                stream = new_stream;
-                device_name = new_name;
-                let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-                sh.device_name = device_name.clone();
-                sh.last_error = None;
-                let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
-                m.sample_rate = rate;
-                m.description = describe(source, &device_name, "live");
-                m.status = "live";
-            }
-            Err(err) => {
-                let detail = format!("{err:#}");
-                let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-                sh.last_error = Some(detail.clone());
-                let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
-                m.description = format!("{} \u{b7} reconnecting ({detail})", source.name());
-                m.status = "reconnecting";
-            }
-        }
+        rebuild_on!(new_device, "device changed");
     }
-    // Channel closed: dropping `stream` stops capture.
-    drop(stream);
+    // Channel closed: dropping the stream stops capture.
+    drop(current);
+}
+
+/// Record a capture control failure honestly in the status meta.
+fn record_control_error(meta: &Arc<Mutex<AudioMeta>>, source: CaptureSource, detail: String) {
+    let mut m = meta.lock().unwrap_or_else(|e| e.into_inner());
+    m.description = format!("{} \u{b7} {} ({detail})", source.name(), "degraded");
+    m.status = "degraded";
 }
 
 fn resolve_device(source: CaptureSource) -> Option<cpal::Device> {

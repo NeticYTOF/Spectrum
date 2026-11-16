@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::f32::consts::PI;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -93,6 +93,7 @@ pub struct SharedState {
 
 pub struct Analyzer {
     bands: usize,
+    sample_rate: f32,
     history: VecDeque<f32>,
     hann: Vec<f32>,
     fft: Arc<dyn Fft<f32>>,
@@ -100,6 +101,8 @@ pub struct Analyzer {
     mags: Vec<f32>,
     prev_mags: Vec<f32>,
     band_bins: Vec<(usize, usize)>,
+    /// Pink-noise display compensation per band (see `band_geometry`).
+    band_tilts: Vec<f32>,
     targets: Vec<f32>,
     flux_hist: VecDeque<f32>,
     bars: Vec<f32>,
@@ -110,6 +113,45 @@ pub struct Analyzer {
     /// a phantom beat.
     was_active: bool,
 }
+
+/// Compute log-spaced band bin ranges plus a gentle pink-noise display
+/// tilt per band. Real music spectra fall roughly -3 dB/octave; tilting
+/// low bands down and high bands up by a fixed cube-root factor makes a
+/// balanced display without auto-gain - quiet passages stay quiet.
+fn band_geometry(sample_rate: f32, bands: usize) -> (Vec<(usize, usize)>, Vec<f32>) {
+    let bins = FFT_SIZE / 2;
+    let nyquist = sample_rate / 2.0;
+    let f_max = MAX_FREQ.min(nyquist * 0.95).max(MIN_FREQ * 4.0);
+
+    // Log-spaced band edges. Sub-bin-width bands share bins rather
+    // than distorting the scale: with a 2048-sample window the lowest
+    // octaves simply cannot be resolved further.
+    let mut band_bins = Vec::with_capacity(bands);
+    let mut band_tilts = Vec::with_capacity(bands);
+    for i in 0..bands {
+        let t0 = i as f32 / bands as f32;
+        let t1 = (i + 1) as f32 / bands as f32;
+        let f0 = MIN_FREQ * (f_max / MIN_FREQ).powf(t0);
+        let f1 = MIN_FREQ * (f_max / MIN_FREQ).powf(t1);
+        let b0 = (f0 * FFT_SIZE as f32 / sample_rate).round() as usize;
+        let b1 = (f1 * FFT_SIZE as f32 / sample_rate).round() as usize;
+        let b0 = b0.clamp(1, bins - 1);
+        let b1 = b1.clamp(b0 + 1, bins);
+        band_bins.push((b0, b1));
+
+        // Pink compensation: bands read flat for a -3 dB/octave source.
+        let center = (f0 * f1).sqrt();
+        let tilt = (center / TILT_REF_HZ).powf(TILT_EXP);
+        band_tilts.push(tilt.clamp(TILT_MIN, TILT_MAX));
+    }
+    (band_bins, band_tilts)
+}
+
+/// Reference frequency for the pink-noise display tilt.
+const TILT_REF_HZ: f32 = 500.0;
+const TILT_EXP: f32 = 1.0 / 3.0;
+const TILT_MIN: f32 = 0.55;
+const TILT_MAX: f32 = 3.0;
 
 impl Analyzer {
     pub fn new(sample_rate: u32, bands: usize) -> Self {
@@ -126,35 +168,19 @@ impl Analyzer {
         } else {
             sample_rate
         }) as f32;
-        let bins = FFT_SIZE / 2;
-        let nyquist = sample_rate / 2.0;
-        let f_max = MAX_FREQ.min(nyquist * 0.95).max(MIN_FREQ * 4.0);
-
-        // Log-spaced band edges. Sub-bin-width bands share bins rather
-        // than distorting the scale: with a 2048-sample window the lowest
-        // octaves simply cannot be resolved further.
-        let mut band_bins = Vec::with_capacity(bands);
-        for i in 0..bands {
-            let t0 = i as f32 / bands as f32;
-            let t1 = (i + 1) as f32 / bands as f32;
-            let f0 = MIN_FREQ * (f_max / MIN_FREQ).powf(t0);
-            let f1 = MIN_FREQ * (f_max / MIN_FREQ).powf(t1);
-            let b0 = (f0 * FFT_SIZE as f32 / sample_rate).round() as usize;
-            let b1 = (f1 * FFT_SIZE as f32 / sample_rate).round() as usize;
-            let b0 = b0.clamp(1, bins - 1);
-            let b1 = b1.clamp(b0 + 1, bins);
-            band_bins.push((b0, b1));
-        }
+        let (band_bins, band_tilts) = band_geometry(sample_rate, bands);
 
         Self {
             bands,
+            sample_rate,
             history: VecDeque::with_capacity(FFT_SIZE * 4),
             hann,
             fft,
             scratch: vec![Complex::new(0.0, 0.0); FFT_SIZE],
-            mags: vec![0.0; bins],
-            prev_mags: vec![0.0; bins],
+            mags: vec![0.0; FFT_SIZE / 2],
+            prev_mags: vec![0.0; FFT_SIZE / 2],
             band_bins,
+            band_tilts,
             targets: vec![0.0; bands],
             flux_hist: VecDeque::with_capacity(FLUX_HISTORY),
             bars: vec![0.0; bands],
@@ -162,6 +188,28 @@ impl Analyzer {
             last_beat: Instant::now(),
             was_active: false,
         }
+    }
+
+    /// Re-map FFT bins to frequencies after the capture device changes
+    /// its sample rate (e.g. 44.1 kHz speakers -> 48 kHz headphones).
+    /// Keeps any in-flight history: mixed-rate windows would smear the
+    /// frequency mapping, and the flux baseline is reseeded so the
+    /// transition can't fire a phantom beat.
+    pub fn set_sample_rate(&mut self, sample_rate: u32) {
+        if sample_rate == 0 {
+            return;
+        }
+        let rate = sample_rate as f32;
+        if (rate - self.sample_rate).abs() < 0.5 {
+            return;
+        }
+        self.sample_rate = rate;
+        let (band_bins, band_tilts) = band_geometry(rate, self.bands);
+        self.band_bins = band_bins;
+        self.band_tilts = band_tilts;
+        self.history.clear();
+        self.was_active = false;
+        self.flux_hist.clear();
     }
 
     pub fn push_sample(&mut self, sample: f32) {
@@ -227,7 +275,8 @@ impl Analyzer {
                     best = self.mags[k];
                 }
             }
-            self.targets[i] = norm(best, params.sensitivity);
+            // Pink-noise compensated display value.
+            self.targets[i] = norm(best * self.band_tilts[i], params.sensitivity);
         }
         let bars_fall = smoothing_factor(rate_from_fraction(params.fall), dt);
         let bars_rise = smoothing_factor(rate_from_fraction(BARS_RISE), dt);
@@ -345,12 +394,18 @@ fn waveform_window(history: &VecDeque<f32>) -> Vec<f32> {
 }
 
 /// Run the analysis loop on its own thread at ~60 Hz.
+///
+/// `rate_watch` carries the live capture sample rate: when the output
+/// device changes (e.g. 44.1 kHz -> 48 kHz), the analyzer remaps its FFT
+/// bin-to-frequency geometry instead of silently analyzing with a stale
+/// rate.
 pub fn spawn_analyzer(
     sample_rate: u32,
     bands: usize,
     queue: SampleQueue,
     shared: Arc<Mutex<SharedState>>,
     stop: Arc<AtomicBool>,
+    rate_watch: Arc<AtomicU32>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("spectrum-analyzer".into())
@@ -369,6 +424,10 @@ pub fn spawn_analyzer(
                         analyzer.push_sample(s);
                         active = true;
                     }
+                }
+                let live_rate = rate_watch.load(Ordering::Relaxed);
+                if live_rate != 0 {
+                    analyzer.set_sample_rate(live_rate);
                 }
                 let params = shared.lock().unwrap_or_else(|e| e.into_inner()).params;
                 let frame = analyzer.tick(&params, active, dt);
@@ -584,6 +643,77 @@ mod tests {
         an.push_sample(f32::INFINITY);
         an.push_sample(0.5);
         assert_eq!(an.history.len(), 1);
+    }
+
+    #[test]
+    fn set_sample_rate_remaps_band_geometry() {
+        // 16 kHz maps to bin 743 at 44.1 kHz but 683 at 48 kHz; the top
+        // band must follow the rate, not stay frozen at the initial one.
+        let mut an = Analyzer::new(44_100, 64);
+        let (_, b1) = an.band_bins[63];
+        assert!(b1 > 700, "44.1 kHz top band should reach ~743, got {b1}");
+        an.set_sample_rate(48_000);
+        let (_, b1_48k) = an.band_bins[63];
+        assert!(
+            (b1_48k as i32 - b1 as i32).abs() > 20,
+            "rate change must remap bins (44.1k: {b1}, 48k: {b1_48k})"
+        );
+    }
+
+    #[test]
+    fn set_sample_rate_clears_history_and_beat_baseline() {
+        let params = Params {
+            sensitivity: 1.0,
+            fall: 0.2,
+        };
+        let mut an = Analyzer::new(44_100, 64);
+        feed_sine(&mut an, 44_100.0, 440.0, FFT_SIZE * 2);
+        let _ = an.tick(&params, true, DT);
+        assert!(!an.history.is_empty());
+
+        an.set_sample_rate(48_000);
+        assert!(an.history.is_empty(), "mixed-rate history must be dropped");
+
+        // First active tick after the transition reseeds the flux baseline:
+        // zero flux, no phantom beat (was_active was cleared).
+        feed_sine(&mut an, 48_000.0, 440.0, FFT_SIZE);
+        let frame = an.tick(&params, true, DT);
+        assert_eq!(frame.flux, 0.0);
+        assert!(!frame.beat);
+    }
+
+    #[test]
+    fn set_sample_rate_ignores_zero_and_noop() {
+        let mut an = Analyzer::new(44_100, 64);
+        an.set_sample_rate(0);
+        let before = an.band_bins.clone();
+        an.set_sample_rate(44_100); // same rate: no rebuild
+        assert_eq!(an.band_bins, before);
+    }
+
+    #[test]
+    fn pink_tilt_lifts_high_bands() {
+        // Equal-magnitude low and high sines: the high band must display
+        // higher thanks to the pink-noise compensation (no auto-gain,
+        // just a fixed per-band display factor).
+        let params = Params {
+            sensitivity: 1.0,
+            fall: 0.2,
+        };
+        let mut an = Analyzer::new(44_100, 64);
+        feed_sine(&mut an, 44_100.0, 120.0, FFT_SIZE * 2);
+        let low = an.tick(&params, true, DT);
+        let low_val = low.bars.iter().cloned().fold(0.0f32, f32::max);
+
+        let mut an2 = Analyzer::new(44_100, 64);
+        feed_sine(&mut an2, 44_100.0, 5000.0, FFT_SIZE * 2);
+        let high = an2.tick(&params, true, DT);
+        let high_val = high.bars.iter().cloned().fold(0.0f32, f32::max);
+
+        assert!(
+            high_val > low_val,
+            "high band ({high_val:.3}) should outrank equal-magnitude low ({low_val:.3})"
+        );
     }
 
     #[test]

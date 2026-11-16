@@ -150,6 +150,7 @@ fn main() -> Result<()> {
             queue.clone(),
             shared.clone(),
             stop.clone(),
+            handle.rate_watch.clone(),
         );
         let r = ui::run(&shared, &handle, theme.name, depth, start_mode, exit_after);
         stop.store(true, Ordering::Relaxed);
