@@ -610,7 +610,7 @@ fn help_text(accent: Color) -> Vec<Line<'static>> {
     lines.extend([
         mk(
             "1 / 2 / 3 / 4 / 5",
-            "spectrum \u{b7} scope \u{b7} spectrogram \u{b7} combo \u{b7} mirror",
+            "spectrum \u{b7} scope \u{b7} spectrogram \u{b7} combo \u{b7} mirror (default)",
         ),
         mk("Tab / Shift+Tab", "cycle visualizations"),
         mk("Space", "pause / resume audio"),
