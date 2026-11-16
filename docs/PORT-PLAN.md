@@ -61,6 +61,20 @@ screenshots), so:
   cells) because their cells cannot shrink either; upstream's chaos knob
   eases from 0.3 toward its "minimal botanical typography" end for small
   type so the garden decorates rather than drowns the letters.
+- **Plant caps (this port's measured correction):** upstream's plants scale
+  with the em (a rose reaches ~0.36 em), which is right when cells shrink
+  with the type. Terminal cells are fixed, so at large type an
+  em-proportional garden towers over the word and clips at the frame
+  (measured on real renders: plants 3.6x the type's pixels, touching the
+  top edge). Plants are therefore capped by the BAND instead - a stem at
+  most ~16% of the band height, a rose ~6%, a leaf ~5% - with variety
+  kept (over-cap sizes squash into the top 30% of the range rather than
+  clipping to one size). The layout reserves the true plant extent and
+  centers type-plus-garden with breathing margins, so nothing clips at
+  a viewport edge; the line pitch (upstream 2.1, here 1.8) keeps one
+  line's plants from reaching the line above's letters. Below 21 band
+  rows the prev/next context lines are dropped so a small terminal keeps
+  the garden at all.
 - Upstream's detail thresholds are in canvas pixels (R >= 16 px for
   outlines etc.); they are converted at its default cell width (~10 px
   per cell), and its `minLw = cw * 0.5` half-cell minimum stroke is kept.

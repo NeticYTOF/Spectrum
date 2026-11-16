@@ -118,22 +118,31 @@ pub fn render_garden(buf: &mut Buffer, area: Rect, view: &GardenView<'_>) {
             if let Some((lines, Some(idx))) = view.lines {
                 let prev = idx.checked_sub(1).map(|i| lines[i].text.clone());
                 let next = lines.get(idx + 1).map(|l| l.text.clone());
-                let has_prev = prev.is_some();
-                let has_next = next.is_some();
+                // Context lines are chrome; below 21 band rows they starve
+                // the garden, so small terminals show only the current line.
+                let show_context = band_h >= 21;
+                let has_prev = prev.is_some() && show_context;
+                let has_next = next.is_some() && show_context;
                 let text = &lines[idx].text;
 
-                if let Some(p) = &prev {
-                    put_text(buf, area, band.y, p, rgb(INK_DIM));
+                if has_prev {
+                    put_text(
+                        buf,
+                        area,
+                        band.y,
+                        prev.as_deref().unwrap_or(""),
+                        rgb(INK_DIM),
+                    );
                 }
-                if let Some(n) = &next {
+                if has_next {
                     let row = area.y + area.height - 1;
-                    put_text(buf, area, row, n, rgb(INK_DIM));
+                    put_text(buf, area, row, next.as_deref().unwrap_or(""), rgb(INK_DIM));
                 }
 
-                let inner_top = band.y + if has_prev { 1 } else { 0 };
+                let inner_top = band.y + u16::from(has_prev);
                 let inner_h = band_h
-                    .saturating_sub(if has_prev { 1 } else { 0 })
-                    .saturating_sub(if has_next { 1 } else { 0 })
+                    .saturating_sub(u16::from(has_prev))
+                    .saturating_sub(u16::from(has_next))
                     .max(2);
                 let inner = Rect::new(band.x, inner_top, band.width, inner_h);
                 render_garden_line(buf, inner, text, view);
@@ -327,6 +336,7 @@ fn build_scene(text: &str, cols: u16, rows: u16) -> SceneData {
             type_mask.draw_glyph(p.ch, p.tx, p.ty, lay.s, mask::SUB);
         }
     }
+    let caps = botany::PlantCaps::for_band(h);
     let chaos = botany::chaos_for(lay.s / 2.0);
     let mut els = Vec::with_capacity(lay.letters.len());
     let mut prev_w: Option<f32> = None;
@@ -352,7 +362,7 @@ fn build_scene(text: &str, cols: u16, rows: u16) -> SceneData {
                 .collect();
             ws_seed = hash_str(&word);
         }
-        els.push(botany::gen(p.ch, ws_seed, wi, prev_w, chaos));
+        els.push(botany::gen(p.ch, ws_seed, wi, prev_w, chaos, caps, lay.s));
         // Bridge spans use the previous letter's em advance.
         prev_w = Some(p.tw / lay.s.max(0.01));
         wi += 1;

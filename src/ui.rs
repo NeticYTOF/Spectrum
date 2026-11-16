@@ -1365,6 +1365,147 @@ mod tests {
         }
     }
 
+    /// Cell-level garden geometry: which band rows carry letters (dark
+    /// ink) and which carry plants (saturated colour). Exact buffer cells.
+    fn garden_rows(buf: &Buffer, w: u16, h: u16) -> (Vec<u16>, Vec<u16>) {
+        let ink = |c: &ratatui::buffer::Cell| {
+            let dark = |x: Color| matches!(x, Color::Rgb(r, g, b) if (r as u16 + g as u16 + b as u16) < 150);
+            dark(c.fg) || dark(c.bg)
+        };
+        let plant = |c: &ratatui::buffer::Cell| {
+            let sat = |x: Color| match x {
+                Color::Rgb(r, g, b) => (r as i32 - g as i32).abs().max((b as i32 - g as i32).abs()),
+                _ => 0,
+            };
+            (sat(c.fg) > 40 || sat(c.bg) > 40) && !ink(c)
+        };
+        let mut letter_rows = Vec::new();
+        let mut plant_rows = Vec::new();
+        for y in 2..h.saturating_sub(1) {
+            let mut letters = 0;
+            let mut plants = 0;
+            for x in 0..w {
+                let c = &buf[(x, y)];
+                if c.symbol() != " " {
+                    if ink(c) {
+                        letters += 1;
+                    } else if plant(c) {
+                        plants += 1;
+                    }
+                }
+            }
+            if letters >= 4 {
+                letter_rows.push(y);
+            }
+            if plants >= 2 {
+                plant_rows.push(y);
+            }
+        }
+        (letter_rows, plant_rows)
+    }
+
+    fn snap_mode6(lyric: Option<&str>, w: u16, h: u16) -> Buffer {
+        snapshot(&Snapshot {
+            mode: 6,
+            theme: "spectrum",
+            depth: ColorDepth::True,
+            at: 4.5,
+            frozen: false,
+            warmup: 1.5,
+            lyric,
+            width: w,
+            height: h,
+        })
+    }
+
+    #[test]
+    fn garden_keeps_breathing_room_at_the_edges() {
+        // Regression: plants used to tower past the band and clip at the
+        // viewport top. The garden must leave the first and last rows of
+        // the band clear of plants for both a short word and the full
+        // lyric fixture, at the reviewer's sizes.
+        for (w, h) in [(144u16, 42u16), (72, 22)] {
+            for lyric in [Some("hello"), None] {
+                let buf = snap_mode6(lyric, w, h);
+                let (_, plant_rows) = garden_rows(&buf, w, h);
+                if let (Some(&top), Some(&bot)) = (plant_rows.first(), plant_rows.last()) {
+                    assert!(top >= 3, "{w}x{h} plants at row {top} (clipped top)");
+                    assert!(
+                        bot <= h - 3,
+                        "{w}x{h} plants at row {bot} of {h} (clipped bottom)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn garden_plants_do_not_tower_over_the_word() {
+        // The upstream demo keeps plants as compact ornaments around the
+        // type; ours used to form a canopy taller than the word itself.
+        // Plants may rise at most a few rows above the letter tops.
+        let (w, h) = (144u16, 42u16);
+        let buf = snap_mode6(Some("hello"), w, h);
+        let (letter_rows, plant_rows) = garden_rows(&buf, w, h);
+        let ltop = letter_rows.first().copied().unwrap_or(0);
+        let ptop = plant_rows.first().copied().unwrap_or(0);
+        assert!(
+            ptop as i32 >= ltop as i32 - 3,
+            "plants rise to row {ptop}, letters start at {ltop}"
+        );
+    }
+
+    #[test]
+    fn small_terminal_keeps_a_sparse_garden() {
+        // 72x22 used to fall back to plain text for the multi-line
+        // fixture; the garden (sparser, via chaos easing) must survive,
+        // with both wrapped lines drawn as type.
+        let (w, h) = (72u16, 22u16);
+        let buf = snap_mode6(None, w, h);
+        let (letter_rows, plant_rows) = garden_rows(&buf, w, h);
+        assert!(!letter_rows.is_empty(), "fixture type missing at {w}x{h}");
+        // Two wrapped lines: a gap of >= 2 rows between letter-row groups.
+        let groups = letter_rows
+            .iter()
+            .fold(Vec::<(u16, u16)>::new(), |mut acc, &y| {
+                match acc.last_mut() {
+                    Some((_, end)) if y <= *end + 1 => *end = y,
+                    _ => acc.push((y, y)),
+                }
+                acc
+            });
+        assert!(groups.len() >= 2, "expected two lines, got {groups:?}");
+        assert!(!plant_rows.is_empty(), "garden missing at {w}x{h}");
+    }
+
+    #[test]
+    #[ignore]
+    fn garden_geometry_probe() {
+        // Cell-level geometry of the garden band: where the letters sit,
+        // where plants reach, and the breathing margins. Exact buffer cells,
+        // no pixel thresholds. Run with --ignored --nocapture.
+        let probe = |lyric: Option<&str>, w: u16, h: u16| {
+            let buf = snap_mode6(lyric, w, h);
+            let (letter_rows, plant_rows) = garden_rows(&buf, w, h);
+            let first = |v: &[u16]| v.first().copied().unwrap_or(u16::MAX);
+            let last = |v: &[u16]| v.last().copied().unwrap_or(0);
+            println!(
+                "{w}x{h} {:?}: letter rows {}..{}  plant rows {}..{}  plant-above {}",
+                lyric.map(|_| "custom").unwrap_or("fixture"),
+                first(&letter_rows),
+                last(&letter_rows),
+                first(&plant_rows),
+                last(&plant_rows),
+                letter_rows.first().copied().unwrap_or(0) as i32
+                    - plant_rows.first().copied().unwrap_or(0) as i32
+            );
+        };
+        for (w, h) in [(144u16, 42u16), (72, 22)] {
+            probe(Some("hello"), w, h);
+            probe(None, w, h);
+        }
+    }
+
     #[test]
     #[ignore]
     fn motion_probe() {

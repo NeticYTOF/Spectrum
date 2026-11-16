@@ -486,9 +486,11 @@ fn silhouette_cell(
         return None;
     }
     // Anti-aliasing through colour: partially covered quadrants pull the
-    // ink toward the paper, fully covered ones stay dark.
+    // ink toward the paper, fully covered ones stay dark. The floor is
+    // high (0.55): at small em sizes contrast keeps the letters readable,
+    // which matters more than a soft edge there.
     let on_cov = (on_sum / on_n).clamp(0.0, 1.0);
-    let ink = mix(PAPER_BG, INK, (0.35 + 0.65 * on_cov).min(1.0));
+    let ink = mix(PAPER_BG, INK, (0.55 + 0.45 * on_cov).min(1.0));
     if bits == 0b1111 {
         // Solid: ink fill, upstream's type glyph family as a faint texture.
         let set = SETS[Role::Type as usize];
@@ -832,6 +834,36 @@ mod tests {
         assert_ne!(cell.symbol(), " ");
         assert_eq!(cell.bg, ratatui::style::Color::Rgb(243, 238, 228));
         assert_eq!(buf[(1, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn guard_protects_other_lines_letters() {
+        // The per-line guard: while drawing a front-layer element of line 2
+        // (guard = 2), subpixels owned by line 1's type must survive.
+        let mut g = MaskGrid::new(4, 1);
+        // Line 1 owns the left half as type.
+        for j in 0..g.h {
+            for i in 0..g.w / 2 {
+                let k = j * g.w + i;
+                g.role[k] = Role::Type as u8;
+                g.owner[k] = 1;
+            }
+        }
+        // A line-2 flower sweeps across the whole row.
+        g.guard = 2;
+        g.fill_rect(0.0, 0.0, 3.9, 1.9, Role::Flower);
+        g.guard = 0;
+        for j in 0..g.h {
+            for i in 0..g.w / 2 {
+                assert_eq!(g.role[j * g.w + i], Role::Type as u8, "line 1 covered");
+            }
+            for i in g.w / 2..g.w {
+                assert_eq!(g.role[j * g.w + i], Role::Flower as u8);
+            }
+        }
+        // With no guard set, the same flower would cover everything.
+        g.fill_rect(0.0, 0.0, 3.9, 1.9, Role::Flower);
+        assert!(g.role.iter().all(|&r| r == Role::Flower as u8));
     }
 
     #[test]

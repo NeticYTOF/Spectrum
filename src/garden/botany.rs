@@ -16,12 +16,55 @@ pub const CHAOS: f32 = 0.3; // "0.3 matches the original Type Garden"
 const PX: f32 = 0.1;
 
 /// Terminal cells cannot shrink with the flowers the way upstream's do
-/// (`targetCh = St/17`), so a rose keeps a minimum footprint of about
-/// five cells across / two-and-a-half rows to stay recognizable, and a
-/// leaf about two cells. Upstream roses at its default size are larger
-/// than this, so the floor only engages for small type.
-const ROSE_MIN_R: f32 = 2.5;
-const LEAF_MIN_L: f32 = 2.0;
+/// (`targetCh = St/17`), so plants are capped by the VIEWPORT rather than
+/// the em: at large type an em-proportional garden towers over the word
+/// and clips at the frame (measured on real renders), while the upstream
+/// demo keeps plants as compact ornaments. The caps are fractions of the
+/// garden band; they only bind when the type is large relative to it.
+#[derive(Clone, Copy, Debug)]
+pub struct PlantCaps {
+    /// Longest stem path, in design units.
+    pub stem: f32,
+    /// Largest rose radius, in design units.
+    pub rose: f32,
+    /// Largest leaf length, in design units.
+    pub leaf: f32,
+}
+
+impl PlantCaps {
+    /// Caps for a garden band of height `band_h` design units: a stem at
+    /// most ~16% of the band, a rose ~6%, a leaf ~5%. Small terminals get
+    /// proportionally smaller (and sparser, via chaos) plants.
+    pub fn for_band(band_h: f32) -> Self {
+        Self {
+            stem: band_h * 0.16,
+            rose: band_h * 0.06,
+            leaf: band_h * 0.05,
+        }
+    }
+
+    /// The garden's vertical extent in em for type size `s`: stems sprout
+    /// up to ~0.3 em inside the letters and grow at most `stem` design
+    /// units with a rose at the tip (upstream's uncapped garden reaches
+    /// ~1.76 em above the baseline, ~1.36 em below).
+    pub fn extent_em(&self, s: f32) -> (f32, f32) {
+        let reach = (self.stem + self.rose) / s;
+        let up = (0.3 + reach).min(1.76);
+        let down = (0.19 + reach).min(1.36);
+        (up, down)
+    }
+}
+
+/// Compress `v` (in em) into `[floor, cap]` keeping variety: values over
+/// the cap squash into the top 30% of the range instead of all clipping
+/// to the same size.
+fn squash(v: f32, floor: f32, cap: f32, rand: f32) -> f32 {
+    if v <= cap {
+        v.max(floor)
+    } else {
+        (cap * (0.7 + 0.3 * rand)).max(floor)
+    }
+}
 
 /// The reference PRNG (garden.ts rng): sfc-style with a 0x6D2B79F5 step.
 /// Runs in u32 because the JS uses `>>>` (logical shifts) throughout.
@@ -284,10 +327,18 @@ struct GrowOpts {
     pts: Option<Vec<P>>,
 }
 
+/// Per-em plant caps for one letter's type size (design-unit caps / s).
+#[derive(Clone, Copy)]
+struct EmCaps {
+    stem: f32,
+    rose: f32,
+    leaf: f32,
+}
+
 /// The recursive grow (garden.ts grow): a stem with leaves and a tip,
 /// possibly branching once more at depth 1.
 #[allow(clippy::too_many_arguments)]
-fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, o: GrowOpts) {
+fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, caps: EmCaps, o: GrowOpts) {
     let tip = match o.tip {
         Some(t) => t.to_string(),
         None => {
@@ -304,13 +355,37 @@ fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, o: GrowOp
         }
     };
     let supplied_pts = o.pts.is_some();
+    // Viewport plant caps: when the type is large relative to the band,
+    // em-proportional plants would tower over the word (upstream's cells
+    // shrink instead); squash them with variety kept.
+    let len = if supplied_pts {
+        o.len
+    } else {
+        squash(o.len, 0.0, caps.stem, r.rf())
+    };
     let mut pts = match o.pts {
-        Some(pts) => pts,
+        Some(pts) => {
+            // A supplied path (the bridge) scales toward its base if the
+            // walk from a to b would exceed the stem cap.
+            let mut q = pts;
+            let mut plen = 0.0;
+            for w in q.windows(2) {
+                plen += (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+            }
+            if plen > caps.stem {
+                let f = caps.stem / plen;
+                let b = q[0];
+                for p in q.iter_mut() {
+                    *p = (b.0 + (p.0 - b.0) * f, b.1 + (p.1 - b.1) * f);
+                }
+            }
+            q
+        }
         None => {
             let mut v = vine(
                 o.base,
                 o.dir,
-                o.len,
+                len,
                 (0.35 + r.rf() * 0.45) * p.curvy,
                 1.0 + r.rf() * 1.6,
                 r.rf() * std::f32::consts::TAU,
@@ -327,10 +402,9 @@ fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, o: GrowOp
             v
         }
     };
-    let _ = supplied_pts;
     let start_layer = o.layer0.unwrap_or(if r.rf() < 0.5 { 0 } else { 1 });
     let segs = weave(r, start_layer);
-    let dur = (320.0_f32).max(o.len * 620.0);
+    let dur = (320.0_f32).max(len * 620.0);
     let mut thorns = Vec::new();
     let nt = (r.rf() * 2.5) as usize;
     for _ in 0..nt {
@@ -363,7 +437,12 @@ fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, o: GrowOp
             x: q.0,
             y: q.1,
             a: a + sd * (0.55 + r.rf() * 0.5),
-            len: (0.14 + r.rf() * 0.2) * if o.depth { 0.8 } else { 1.0 },
+            len: squash(
+                (0.14 + r.rf() * 0.2) * if o.depth { 0.8 } else { 1.0 },
+                0.0,
+                caps.leaf,
+                r.rf(),
+            ),
             bend: (r.rf() - 0.5) * 1.2,
             layer: layer_at(&segs, u),
             d0: o.d0 + dur * u,
@@ -375,7 +454,12 @@ fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, o: GrowOp
     let tl = layer_at(&segs, 1.0);
     match tip.as_str() {
         "rose" => {
-            let r_size = (0.13 + r.rf() * 0.15) * p.big * if o.depth { 0.75 } else { 1.0 };
+            let r_size = squash(
+                (0.13 + r.rf() * 0.15) * p.big * if o.depth { 0.75 } else { 1.0 },
+                0.0,
+                caps.rose,
+                r.rf(),
+            );
             // Legibility: a flower over the letter body mostly goes behind.
             let over = tp.1 > -0.78 && tp.1 < 0.05 && tp.0.abs() < p.w * 0.5;
             let layer = if over {
@@ -427,7 +511,7 @@ fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, o: GrowOp
                     x: tp.0,
                     y: tp.1,
                     a: ta + (j as f32 - 0.5) * spread,
-                    len: 0.2 + r.rf() * 0.2,
+                    len: squash(0.2 + r.rf() * 0.2, 0.0, caps.leaf, r.rf()),
                     bend: (j as f32 - 0.5) * 0.8,
                     layer: tl,
                     d0: td + j as f32 * 60.0,
@@ -441,7 +525,7 @@ fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, o: GrowOp
                 x: tp.0,
                 y: tp.1,
                 a: ta + (r.rf() - 0.5) * 0.3,
-                len: 0.16 + r.rf() * 0.16,
+                len: squash(0.16 + r.rf() * 0.16, 0.0, caps.leaf, r.rf()),
                 bend: r.rf() - 0.5,
                 layer: tl,
                 d0: td,
@@ -464,10 +548,11 @@ fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, o: GrowOp
                 els,
                 nid,
                 p,
+                caps,
                 GrowOpts {
                     base: q,
                     dir: a + if sign_flip { -1.0 } else { 1.0 } * branch_mag,
-                    len: o.len * len_scale,
+                    len: len * len_scale,
                     d0: o.d0 + dur * u,
                     depth: true,
                     layer0: Some(layer_here),
@@ -481,14 +566,30 @@ fn grow(r: &mut Rng, els: &mut Vec<El>, nid: &mut u32, p: &WordParams, o: GrowOp
 
 /// The elements of one letter (garden.ts gen, deterministically seeded:
 /// the reference's Math.random component is replaced by the word seed so
-/// a frozen frame is reproducible).
-pub fn gen(ch: char, ws: i32, wi: usize, prev_w: Option<f32>, chaos: f32) -> LetterEls {
+/// a frozen frame is reproducible). `caps` are the viewport plant caps in
+/// design units, converted to em with the type size `s`.
+pub fn gen(
+    ch: char,
+    ws: i32,
+    wi: usize,
+    prev_w: Option<f32>,
+    chaos: f32,
+    caps: PlantCaps,
+    s: f32,
+) -> LetterEls {
     let mut r = Rng::new(
         ws ^ ((wi as i32)
             .wrapping_add(1)
             .wrapping_mul(2654435761u32 as i32)),
     );
     let p = word_params(ws, chaos);
+    // Absolute floors keep plants recognizable at tiny type; the viewport
+    // caps keep them from towering at large type. Both in em at this s.
+    let em_caps = EmCaps {
+        stem: (caps.stem / s).max(0.2),
+        rose: (caps.rose / s).max(0.08).max(2.5 / s),
+        leaf: (caps.leaf / s).max(0.08).max(2.0 / s),
+    };
     let w = super::font::advance(ch).unwrap_or(0.5);
     let mut els: Vec<El> = Vec::new();
     let mut nid: u32 = 0;
@@ -513,6 +614,7 @@ pub fn gen(ch: char, ws: i32, wi: usize, prev_w: Option<f32>, chaos: f32) -> Let
             &mut els,
             &mut nid,
             &p,
+            em_caps,
             GrowOpts {
                 base,
                 dir,
@@ -534,6 +636,7 @@ pub fn gen(ch: char, ws: i32, wi: usize, prev_w: Option<f32>, chaos: f32) -> Let
             &mut els,
             &mut nid,
             &p,
+            em_caps,
             GrowOpts {
                 base,
                 dir,
@@ -578,6 +681,7 @@ pub fn gen(ch: char, ws: i32, wi: usize, prev_w: Option<f32>, chaos: f32) -> Let
                 &mut els,
                 &mut nid,
                 &p,
+                em_caps,
                 GrowOpts {
                     base: (0.0, 0.0),
                     dir: 0.0,
@@ -600,6 +704,7 @@ pub fn gen(ch: char, ws: i32, wi: usize, prev_w: Option<f32>, chaos: f32) -> Let
             &mut els,
             &mut nid,
             &p,
+            em_caps,
             GrowOpts {
                 base,
                 dir,
@@ -625,6 +730,7 @@ pub fn gen(ch: char, ws: i32, wi: usize, prev_w: Option<f32>, chaos: f32) -> Let
             &mut t_els,
             &mut tn,
             &p,
+            em_caps,
             GrowOpts {
                 base,
                 dir,
@@ -967,7 +1073,7 @@ pub fn draw_scene(
                     return;
                 }
                 let (wx, wy) = wpt(x0, y0, x0 + x * s + j.0, y0 + y * s + j.1, s, w_design, t_s);
-                draw_leaf(g, wx, wy, a + j.2, (len * s).max(LEAF_MIN_L) * sc, *bend);
+                draw_leaf(g, wx, wy, a + j.2, len * s * sc, *bend);
             }
             El::Rose {
                 x,
@@ -985,17 +1091,7 @@ pub fn draw_scene(
                     return;
                 }
                 let (wx, wy) = wpt(x0, y0, x0 + x * s + j.0, y0 + y * s + j.1, s, w_design, t_s);
-                draw_rose(
-                    g,
-                    wx,
-                    wy,
-                    (r * s).max(ROSE_MIN_R),
-                    rot + j.2,
-                    *ph1,
-                    *ph2,
-                    *turns,
-                    a,
-                );
+                draw_rose(g, wx, wy, r * s, rot + j.2, *ph1, *ph2, *turns, a);
             }
         }
     };
@@ -1085,15 +1181,39 @@ mod tests {
 
     #[test]
     fn gen_is_deterministic_and_produces_elements() {
-        let a = gen('g', 12345, 0, Some(0.5), CHAOS);
-        let b = gen('g', 12345, 0, Some(0.5), CHAOS);
+        let a = gen(
+            'g',
+            12345,
+            0,
+            Some(0.5),
+            CHAOS,
+            PlantCaps::for_band(80.0),
+            17.8,
+        );
+        let b = gen(
+            'g',
+            12345,
+            0,
+            Some(0.5),
+            CHAOS,
+            PlantCaps::for_band(80.0),
+            17.8,
+        );
         assert_eq!(format!("{:?}", a.els.len()), format!("{:?}", b.els.len()));
         assert!(!a.els.is_empty(), "a letter must grow something");
-        let rose_first = gen('s', 999, 0, None, CHAOS);
+        let rose_first = gen('s', 999, 0, None, CHAOS, PlantCaps::for_band(80.0), 17.8);
         // First letter of a word starts with a rose-tipped stem.
         assert!(matches!(rose_first.els[0], El::Stem { .. }));
         // Different seeds give different gardens.
-        let c = gen('g', 54321, 0, Some(0.5), CHAOS);
+        let c = gen(
+            'g',
+            54321,
+            0,
+            Some(0.5),
+            CHAOS,
+            PlantCaps::for_band(80.0),
+            17.8,
+        );
         assert!(
             format!("{:?}", a.els) != format!("{:?}", c.els),
             "seeds must vary the garden"
@@ -1122,7 +1242,7 @@ mod tests {
     #[test]
     fn draw_scene_paints_type_stems_and_roses() {
         use super::super::mask::{Role, N_SUB};
-        let els = gen('o', 4242, 0, None, CHAOS);
+        let els = gen('o', 4242, 0, None, CHAOS, PlantCaps::for_band(80.0), 17.8);
         let letters = [SceneLetter {
             ch: 'o',
             tx: 4.0,

@@ -35,19 +35,15 @@ pub struct Layout {
     pub n_lines: usize,
 }
 
-/// Line pitch in ems. Upstream uses 2.1 so its garden fits between
-/// lines; lyrics need the size more, and stems still weave between the
-/// lines through the back/front layers.
-pub const LINE_PITCH: f32 = 1.55;
+/// Line pitch in ems. Upstream uses 2.1 so its garden fits between lines;
+/// 1.8 keeps that separation while letting narrow terminals keep a
+/// (sparser) garden instead of falling back to plain text.
+pub const LINE_PITCH: f32 = 1.8;
 /// Share of the band width a line may use.
 const WIDTH_FRAC: f32 = 0.88;
-/// Share of the band height the type block may use (the rest is garden
-/// headroom, mostly above the type).
-const HEIGHT_FRAC: f32 = 0.64;
-/// Share of the free vertical space placed above the type block: the
-/// garden grows mostly upward from the letters, so the headroom belongs
-/// above (upstream's single line sits a third of an em below centre).
-const ABOVE_FRAC: f32 = 0.74;
+/// Margin (design units) kept clear of garden plants at the top and
+/// bottom of the band, so nothing clips at a viewport edge.
+const VMARGIN: f32 = 2.0;
 
 fn adv(c: char) -> f32 {
     font::advance(c).unwrap_or(0.5)
@@ -157,7 +153,17 @@ pub fn layout(text: &str, w: f32, h: f32) -> Layout {
         };
     }
     let max_w = w * WIDTH_FRAC;
-    let max_h = h * HEIGHT_FRAC;
+    // The garden's vertical extent for a candidate size: plants are capped
+    // by the viewport (botany::PlantCaps), so what must fit in the band -
+    // type, garden and breathing margins - is
+    //   (n-1)*LH*s + up(s) + down(s) <= h - 2*VMARGIN,
+    // with up(s) = min(1.76, 0.3 + caps/s) em and down likewise. The
+    // extent switches regimes at s* = caps_sum/1.46; the largest valid s
+    // is the uncapped solution while it stays under s*, else the capped
+    // regime's.
+    let caps = super::botany::PlantCaps::for_band(h);
+    let caps_sum = caps.stem + caps.rose;
+    let s_switch = caps_sum / 1.46;
     let size_for = |lines: &[Vec<usize>], words: &[Vec<char>]| -> f32 {
         let n = lines.len() as f32;
         let widest = lines
@@ -165,8 +171,15 @@ pub fn layout(text: &str, w: f32, h: f32) -> Layout {
             .map(|l| line_width(words, l))
             .fold(0.0f32, f32::max)
             .max(0.01);
-        let block = (n - 1.0) * LINE_PITCH + ink_h;
-        (max_w / widest).min(max_h / block)
+        let by_width = max_w / widest;
+        let usable = (h - 2.0 * VMARGIN).max(1.0);
+        let s_u = usable / ((n - 1.0) * LINE_PITCH + 3.12);
+        let by_height = if s_u <= s_switch {
+            s_u
+        } else {
+            (usable - 2.0 * caps_sum).max(0.5) / ((n - 1.0) * LINE_PITCH + 0.49)
+        };
+        by_width.min(by_height).max(0.5)
     };
 
     let search = |words: &[Vec<char>]| {
@@ -190,7 +203,7 @@ pub fn layout(text: &str, w: f32, h: f32) -> Layout {
     // When one long word forces the type below a legible em (~3 rows =
     // 6 design units), split such words into chunks (upstream does the
     // same for words that cannot wrap) and search again.
-    let legible_s = 6.0f32.min(max_h / ink_h);
+    let legible_s = 6.0f32.min((h - 2.0 * VMARGIN) / ink_h);
     let limit_em = max_w / legible_s;
     if chosen.0 < legible_s && words.iter().any(|wd| run_w(wd) > limit_em) {
         words = split_long(words, limit_em);
@@ -199,14 +212,19 @@ pub fn layout(text: &str, w: f32, h: f32) -> Layout {
     let (s, lines) = chosen;
 
     let n = lines.len();
-    let block_h = ((n as f32 - 1.0) * LINE_PITCH + ink_h) * s;
-    let top = ((h - block_h).max(0.0)) * ABOVE_FRAC;
+    // Center the full garden span (plants above the first baseline,
+    // descenders and down-plants below the last) with the breathing
+    // margins - guaranteed inside the band by the size solve above.
+    let (up_em, down_em) = caps.extent_em(s);
+    let span = up_em * s + (n as f32 - 1.0) * LINE_PITCH * s + down_em * s;
+    let slack = (h - span - 2.0 * VMARGIN).max(0.0);
+    let top = VMARGIN + slack / 2.0 + up_em * s;
     let mut letters = Vec::new();
     let space = adv(' ');
     for (k, line) in lines.iter().enumerate() {
         let lw = line_width(&words, line) * s;
         let mut x = (w - lw) / 2.0;
-        let baseline = top + m.ascender * s + k as f32 * LINE_PITCH * s;
+        let baseline = top + k as f32 * LINE_PITCH * s;
         for (wi, &idx) in line.iter().enumerate() {
             if wi > 0 {
                 let sw = space * s;
@@ -306,9 +324,10 @@ mod tests {
     #[ignore]
     fn print_layouts() {
         for (w, h, t) in [
-            (144.0, 74.0, "every beat a budding bloom"),
-            (144.0, 74.0, "hello"),
-            (72.0, 34.0, "every beat a budding bloom"),
+            (144.0, 80.0, "every beat a budding bloom"),
+            (144.0, 80.0, "hello"),
+            (72.0, 36.0, "every beat a budding bloom"),
+            (72.0, 36.0, "hello"),
         ] {
             let l = layout(t, w, h);
             let ys: Vec<f32> = l
