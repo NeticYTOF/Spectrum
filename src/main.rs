@@ -116,7 +116,7 @@ fn main() -> Result<()> {
     }));
 
     let stop = Arc::new(AtomicBool::new(false));
-    let exit_after = args.exit_after.map(|secs| Duration::from_secs_f32(secs));
+    let exit_after = args.exit_after.map(Duration::from_secs_f32);
 
     let result = if args.demo {
         // No audio hardware is touched at all.
