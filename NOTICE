@@ -19,9 +19,8 @@ documented in docs/PORT-PLAN.md. ascii-garden is itself a
 reinterpretation of Akshat Agarwal's Type Garden, and its cell-grid
 ASCII approach is adapted from ascii-animals by drewdi /
 DesignerStephen1; those works keep their own licences and copyrights.
-The letterforms here are original bitmap serifs drawn for this
-project; no font files (Playfair Display, Georgia or otherwise) are
-bundled or extracted. No Type Garden assets were used.
+The garden's type is the genuine Playfair Display font (see below),
+as in the reference. No Type Garden assets were used.
 
 MIT License
 
@@ -44,6 +43,31 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+
+Playfair Display (assets/fonts/playfair-display/)
+
+The file PlayfairDisplay[wght].ttf is embedded UNMODIFIED, exactly as
+published in google/fonts (ofl/playfairdisplay, git blob
+7a09eb71f10622fd083134ac9ed46f59b21bee18); the weight axis is set to 700
+at runtime, no derived font file is produced. Its licence, copied
+verbatim alongside it as OFL.txt (git blob
+13153890847ba9bde8a852596d1515261156e474), begins:
+
+Copyright 2017 The Playfair Display Project Authors
+(https://github.com/clauseggers/Playfair-Display), with Reserved Font
+Name "Playfair Display"
+
+This Font Software is licensed under the SIL Open Font License,
+Version 1.1. The full licence text is in
+assets/fonts/playfair-display/OFL.txt. The font is not sold by itself
+and remains under the OFL; Spectrum's own licence does not apply to it.
+
+-------------------------------------------------------------------------------
+
+ab_glyph (https://github.com/alexheretic/ab_glyph), used to rasterize the
+font, is Apache-2.0 licensed and distributed through crates.io.
 
 -------------------------------------------------------------------------------
 

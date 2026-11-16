@@ -6,6 +6,9 @@ description = "A terminal-native audio visualizer with real-time FFT analysis"
 license = "MIT"
 
 [dependencies]
+# Pure-Rust outline rasterizer for the garden's genuine Playfair Display
+# type (embedded unmodified, OFL-1.1; see assets/fonts and NOTICE).
+ab_glyph = "0.2.32"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 cpal = "0.15"
