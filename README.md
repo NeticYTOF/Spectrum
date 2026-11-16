@@ -21,8 +21,9 @@ with Unicode blocks, braille dots and ANSI color.
 - **Bars + Wave** - oscilloscope overlaid on the spectrum bars
 - **Mirrored spectrum** - bars growing outward from a center line
 - **Beat detection** - spectral flux drives a border/`♪` flash
-- **Color themes** - spectrum, fire, ice, matrix, vapor; gradients map to
-  your terminal's color depth with optional ordered dithering
+- **Color themes** - spectrum, fire, ice, matrix, vapor; gradients get a
+  deliberate ordered-stipple dither between steps (visible in truecolor,
+  consistent in 256/16)
 - **Live tuning** - sensitivity, smoothing and volume adjustable while
   running; all animation is frame-rate independent
 
@@ -39,9 +40,9 @@ cargo build --release
 Use `cargo build --release -j 2` if you want to bound build-time memory.
 
 A truecolor terminal is recommended (Windows Terminal, WezTerm, kitty,
-iTerm2, Alacritty, modern gnome-terminal). On 256/16-color terminals run
-with `--colors 256` or `--colors 16` for quantized gradients with ordered
-dithering.
+iTerm2, Alacritty, modern gnome-terminal). The signature gradient stipple
+renders in every depth; on 256/16-color terminals run with `--colors 256`
+or `--colors 16` for the nearest-palette equivalent.
 
 ## Usage
 
@@ -73,7 +74,7 @@ spectrum --demo --mode 4 --exit-after 10  # scripted QA / screenshots
 | `--bars N` | 64 | Frequency bands (8..=256) |
 | `--sensitivity F` | 1.0 | FFT display gain (0.1..=4.0, must be finite) |
 | `--smoothing F` | 0.12 | Bar fall speed (0.01 slow .. 0.95 instant) |
-| `--colors MODE` | true | true (24-bit), 256 or 16 (both dithered) |
+| `--colors MODE` | true | true (24-bit), 256 or 16 (all stipple-dithered) |
 
 Capture honesty: `--source system` opens the default *output* device via
 WASAPI loopback and never silently falls back to the microphone - if it
