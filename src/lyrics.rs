@@ -292,15 +292,14 @@ pub fn spawn_lyrics(
                 }
 
                 let now = Instant::now();
-                let mut status = None;
                 let mut retry_at: Option<Instant> = None;
-                match cooldown_action(&cache, &cooldowns, &req.key, now, COOLDOWN) {
-                    CooldownAction::Cached(hit) => status = Some(hit),
+                let status = match cooldown_action(&cache, &cooldowns, &req.key, now, COOLDOWN) {
+                    CooldownAction::Cached(hit) => hit,
                     CooldownAction::CoolingDown(err, remaining) => {
                         // Keep serving the cached error; retry when the
                         // ORIGINAL deadline elapses - no renewal.
                         retry_at = Some(now + remaining);
-                        status = Some(err);
+                        err
                     }
                     CooldownAction::Fetch => {
                         let s = lookup_interruptible(&agent, &req.key, &stop);
@@ -318,10 +317,9 @@ pub fn spawn_lyrics(
                             }
                             retry_at = Some(now + COOLDOWN);
                         }
-                        status = Some(s);
+                        s
                     }
-                }
-                let status = status.expect("every branch sets a status");
+                };
 
                 match &status {
                     // Terminal: cache so the same identity never refetches.
@@ -953,7 +951,7 @@ mod tests {
         // several revisits within the window, the remaining time still
         // counts from the ORIGINAL failure.
         let k = key();
-        let mut cache = HashMap::new();
+        let cache = HashMap::new();
         let mut cooldowns = HashMap::new();
         let cooldown = Duration::from_secs(60);
 
@@ -967,7 +965,7 @@ mod tests {
                 CooldownAction::CoolingDown(_, remaining) => {
                     // Remaining shrinks with the ORIGINAL start: at t0+30,
                     // 30s remain (not 60 - renewal would reset it).
-                    let expected = (60 - offset) as u64;
+                    let expected = 60 - offset;
                     assert!(
                         remaining.as_secs().abs_diff(expected) <= 1,
                         "revisit at +{offset}s must keep the original deadline, got {}s left",
