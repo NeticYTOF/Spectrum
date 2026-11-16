@@ -806,14 +806,25 @@ mod tests {
             let mut ink = 0;
             let mut stem = 0;
             let mut flower = 0;
+            let mut drawn = 0;
             for c in buf.content() {
+                if c.symbol() != " " {
+                    drawn += 1;
+                }
                 match c.fg {
-                    Color::Rgb(26, 26, 26) => ink += 1,
-                    Color::Rgb(28, 43, 143) => stem += 1,
-                    Color::Rgb(232, 61, 95) => flower += 1,
+                    Color::Rgb(17, 17, 17) => ink += 1,
+                    Color::Rgb(r, _g, b)
+                        if b as i32 > r as i32 + 40 && b as i32 > _g as i32 + 20 =>
+                    {
+                        stem += 1;
+                    }
+                    Color::Rgb(r, _g, b) if r as i32 > 170 && r as i32 > b as i32 + 40 => {
+                        flower += 1;
+                    }
                     _ => {}
                 }
             }
+            assert!(drawn > 40, "{w}x{h}: garden drew {drawn} cells");
             assert!(ink > 0, "{w}x{h}: no lyric ink drawn");
             assert!(stem > 0, "{w}x{h}: no stems drawn");
             assert!(flower > 0, "{w}x{h}: no flowers drawn");
@@ -850,8 +861,14 @@ mod tests {
                         ' '
                     } else {
                         match c.fg {
-                            Color::Rgb(28, 43, 143) | Color::Rgb(90, 112, 200) => 'b',
-                            Color::Rgb(232, 61, 95) | Color::Rgb(255, 210, 196) => 'p',
+                            Color::Rgb(r, g, b)
+                                if b as i32 > r as i32 + 40 && b as i32 > g as i32 + 20 =>
+                            {
+                                'b'
+                            }
+                            Color::Rgb(r, _g, b) if r as i32 > 170 && r as i32 > b as i32 + 40 => {
+                                'p'
+                            }
                             _ => '#',
                         }
                     });
@@ -859,6 +876,34 @@ mod tests {
                 println!("{}", row.trim_end());
             }
             println!("=====");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_letterforms() {
+        // Zoomed letterforms: render a word at a large S directly into a
+        // mask and print the Type role as text art.
+        use crate::garden::font;
+        use crate::garden::mask::{MaskGrid, Role};
+        let word = "garden";
+        let mut g = MaskGrid::new(40, 14);
+        let mut x = 1.0f32;
+        let s = 16.0; // design px; 14 rows = 28 design units tall
+        for ch in word.chars() {
+            font::draw_glyph(&mut g, ch, x, 22.0, s);
+            x += font::advance(ch).unwrap() * s;
+        }
+        for j in 0..g.h {
+            let mut row = String::new();
+            for i in 0..g.w {
+                row.push(if g.role[j * g.w + i] == Role::Type as u8 {
+                    '#'
+                } else {
+                    ' '
+                });
+            }
+            println!("{}", row.trim_end());
         }
     }
 
