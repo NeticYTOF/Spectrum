@@ -111,8 +111,8 @@ fn main() -> Result<()> {
 
     let start_mode = match args.mode {
         None => None,
-        Some(m) if (1..=5).contains(&m) => Some(m),
-        Some(m) => bail!("--mode must be 1-5, got {m}"),
+        Some(m) if (1..=6).contains(&m) => Some(m),
+        Some(m) => bail!("--mode must be 1-6, got {m}"),
     };
 
     // Clamp once here so every component sees consistent values.
@@ -131,8 +131,14 @@ fn main() -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let exit_after = args.exit_after.map(Duration::from_secs_f32);
 
+    // Media + lyrics pipeline: shared snapshots the UI reads.
+    let media_shared = spectrum::media::new_shared();
+    let lyrics_shared = spectrum::lyrics::new_shared();
+    let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
     let result = if args.demo {
-        // No audio hardware is touched at all.
+        // No audio hardware is touched at all; the demo fixture drives
+        // both the analysis frames and the synthetic media session.
         let handle = audio::AudioHandle::for_demo();
         let demo_thread = demo::spawn_demo(
             shared.clone(),
@@ -141,9 +147,31 @@ fn main() -> Result<()> {
             handle.demo_pause.clone(),
             args.freeze_at,
         );
-        let r = ui::run(&shared, &handle, theme.name, depth, start_mode, exit_after);
+        worker_threads.push(demo_thread);
+        let pause = handle.demo_pause.clone().unwrap();
+        let media_thread =
+            demo::spawn_demo_media(media_shared.clone(), stop.clone(), pause, args.freeze_at);
+        worker_threads.push(media_thread);
+        // The demo fixture's lyrics ship locally (no network, no
+        // copyrighted content): seed the lyrics state directly.
+        {
+            let mut st = lyrics_shared.lock().unwrap();
+            st.status = spectrum::lyrics::LyricsStatus::Synced(demo::demo_lyric_lines());
+        }
+        let r = ui::run(spectrum::ui::RunConfig {
+            shared: &shared,
+            audio: &handle,
+            media: &media_shared,
+            lyrics: &lyrics_shared,
+            theme_name: theme.name,
+            depth,
+            start_mode,
+            exit_after,
+        });
         stop.store(true, Ordering::Relaxed);
-        let _ = demo_thread.join();
+        for t in worker_threads {
+            let _ = t.join();
+        }
         r
     } else {
         let queue: SampleQueue = audio::new_queue();
@@ -166,9 +194,29 @@ fn main() -> Result<()> {
             stop.clone(),
             handle.rate_watch.clone(),
         );
-        let r = ui::run(&shared, &handle, theme.name, depth, start_mode, exit_after);
+        worker_threads.push(analyzer);
+        let media_thread = spectrum::media::spawn_media(media_shared.clone(), stop.clone());
+        worker_threads.push(media_thread);
+        let lyrics_thread = spectrum::lyrics::spawn_lyrics(
+            media_shared.clone(),
+            lyrics_shared.clone(),
+            stop.clone(),
+        );
+        worker_threads.push(lyrics_thread);
+        let r = ui::run(spectrum::ui::RunConfig {
+            shared: &shared,
+            audio: &handle,
+            media: &media_shared,
+            lyrics: &lyrics_shared,
+            theme_name: theme.name,
+            depth,
+            start_mode,
+            exit_after,
+        });
         stop.store(true, Ordering::Relaxed);
-        let _ = analyzer.join();
+        for t in worker_threads {
+            let _ = t.join();
+        }
         r
     };
 

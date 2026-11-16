@@ -394,12 +394,6 @@ fn read_bounded(resp: ureq::Response) -> FetchBody {
     }
 }
 
-/// Simple deterministic pseudo-random helper used by tests for jitter math.
-#[cfg(test)]
-pub(crate) fn test_jitter(seed: u64) -> f64 {
-    (seed % 1000) as f64 / 1000.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

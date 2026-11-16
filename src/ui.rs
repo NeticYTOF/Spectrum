@@ -30,6 +30,7 @@ pub enum Mode {
     Gram,
     Combo,
     Mirror,
+    Lyrics,
 }
 
 impl Mode {
@@ -40,6 +41,7 @@ impl Mode {
             Mode::Gram => "Spectrogram",
             Mode::Combo => "Bars + Wave",
             Mode::Mirror => "Mirrored Spectrum",
+            Mode::Lyrics => "Lyrics Garden",
         }
     }
 
@@ -49,17 +51,19 @@ impl Mode {
             Mode::Scope => Mode::Gram,
             Mode::Gram => Mode::Combo,
             Mode::Combo => Mode::Mirror,
-            Mode::Mirror => Mode::Bars,
+            Mode::Mirror => Mode::Lyrics,
+            Mode::Lyrics => Mode::Bars,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Mode::Bars => Mode::Mirror,
+            Mode::Bars => Mode::Lyrics,
             Mode::Scope => Mode::Bars,
             Mode::Gram => Mode::Scope,
             Mode::Combo => Mode::Gram,
             Mode::Mirror => Mode::Combo,
+            Mode::Lyrics => Mode::Mirror,
         }
     }
 }
@@ -88,6 +92,11 @@ pub struct App {
     themes: Vec<Theme>,
     theme_idx: usize,
     depth: ColorDepth,
+    /// Garden bookkeeping: the current lyric line and when it changed
+    /// (drives bloom), plus smoothed energy for the sway.
+    lyric_line: Option<usize>,
+    lyric_changed_at: Instant,
+    sway_energy: f32,
 }
 
 impl App {
@@ -123,6 +132,9 @@ impl App {
             themes,
             theme_idx,
             depth,
+            lyric_line: None,
+            lyric_changed_at: Instant::now(),
+            sway_energy: 0.0,
         }
     }
 
@@ -131,16 +143,31 @@ impl App {
     }
 }
 
+/// Configuration for a single `ui::run` invocation.
+pub struct RunConfig<'a> {
+    pub shared: &'a Arc<Mutex<SharedState>>,
+    pub audio: &'a AudioHandle,
+    pub media: &'a crate::media::MediaShared,
+    pub lyrics: &'a crate::lyrics::LyricsShared,
+    pub theme_name: &'a str,
+    pub depth: ColorDepth,
+    pub start_mode: Option<u8>,
+    pub exit_after: Option<std::time::Duration>,
+}
+
 /// Run the UI to completion. The terminal is always restored, even on
 /// error or panic (see `install_panic_hook`).
-pub fn run(
-    shared: &Arc<Mutex<SharedState>>,
-    audio: &AudioHandle,
-    theme_name: &str,
-    depth: ColorDepth,
-    start_mode: Option<u8>,
-    exit_after: Option<std::time::Duration>,
-) -> Result<()> {
+pub fn run(cfg: RunConfig<'_>) -> Result<()> {
+    let RunConfig {
+        shared,
+        audio,
+        media,
+        lyrics,
+        theme_name,
+        depth,
+        start_mode,
+        exit_after,
+    } = cfg;
     install_panic_hook();
     enable_raw_mode()?;
 
@@ -156,7 +183,8 @@ pub fn run(
                 2 => Mode::Scope,
                 3 => Mode::Gram,
                 4 => Mode::Combo,
-                _ => Mode::Mirror,
+                5 => Mode::Mirror,
+                _ => Mode::Lyrics,
             };
         }
         let started = Instant::now();
@@ -164,6 +192,8 @@ pub fn run(
             &mut terminal,
             shared,
             audio,
+            media,
+            lyrics,
             &mut app,
             exit_after.map(|d| started + d),
         );
@@ -181,6 +211,8 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     shared: &Arc<Mutex<SharedState>>,
     audio: &AudioHandle,
+    media: &crate::media::MediaShared,
+    lyrics: &crate::lyrics::LyricsShared,
     app: &mut App,
     exit_at: Option<Instant>,
 ) -> Result<()> {
@@ -243,7 +275,7 @@ fn event_loop(
             app.gram_accum = GRAM_INTERVAL_SECS;
         }
 
-        terminal.draw(|f| draw(f, app, &analysis, audio, dt))?;
+        terminal.draw(|f| draw(f, app, &analysis, audio, media, lyrics, dt))?;
 
         if app.quit {
             return Ok(());
@@ -270,6 +302,7 @@ fn on_key(app: &mut App, shared: &Arc<Mutex<SharedState>>, audio: &AudioHandle, 
         KeyCode::Char('3') => set_mode(app, Mode::Gram),
         KeyCode::Char('4') => set_mode(app, Mode::Combo),
         KeyCode::Char('5') => set_mode(app, Mode::Mirror),
+        KeyCode::Char('6') => set_mode(app, Mode::Lyrics),
         KeyCode::Tab => set_mode(app, app.mode.next()),
         KeyCode::BackTab => set_mode(app, app.mode.prev()),
         KeyCode::Char(' ') => {
@@ -325,7 +358,15 @@ fn adjust_fall(app: &mut App, shared: &Arc<Mutex<SharedState>>, delta: f32) {
     shared.lock().unwrap_or_else(|e| e.into_inner()).params.fall = app.fall;
 }
 
-fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHandle, dt: f32) {
+fn draw(
+    f: &mut Frame,
+    app: &mut App,
+    analysis: &FrameAnalysis,
+    audio: &AudioHandle,
+    media: &crate::media::MediaShared,
+    lyrics: &crate::lyrics::LyricsShared,
+    dt: f32,
+) {
     let area = f.area();
     if area.width < 12 || area.height < 5 {
         return; // too small to render anything useful
@@ -437,6 +478,7 @@ fn draw(f: &mut Frame, app: &mut App, analysis: &FrameAnalysis, audio: &AudioHan
             scratch,
         ),
         Mode::Gram => visualizers::render_spectrogram(f.buffer_mut(), inner, gram, theme),
+        Mode::Lyrics => render_lyrics(f.buffer_mut(), inner, app, analysis, media, lyrics, dt),
     }
 
     f.render_widget(Paragraph::new(status), status_area);
@@ -609,8 +651,8 @@ fn help_text(accent: Color) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     lines.extend([
         mk(
-            "1 / 2 / 3 / 4 / 5",
-            "spectrum \u{b7} scope \u{b7} spectrogram \u{b7} combo \u{b7} mirror (default)",
+            "1 / 2 / 3 / 4 / 5 / 6",
+            "spectrum \u{b7} scope \u{b7} spectrogram \u{b7} combo \u{b7} mirror (default) \u{b7} lyrics garden",
         ),
         mk("Tab / Shift+Tab", "cycle visualizations"),
         mk("Space", "pause / resume audio"),
@@ -636,6 +678,59 @@ fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
 }
 
 /// Never leave the terminal broken after a panic.
+fn render_lyrics(
+    buf: &mut ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    app: &mut App,
+    analysis: &FrameAnalysis,
+    media: &crate::media::MediaShared,
+    lyrics: &crate::lyrics::LyricsShared,
+    dt: f32,
+) {
+    let snap = media.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let state = lyrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    // Smoothed energy drives the sway (quiet passages stay still).
+    let energy_now: f32 = analysis.bars.iter().sum::<f32>() / analysis.bars.len().max(1) as f32;
+    app.sway_energy += (energy_now - app.sway_energy) * (1.0 - (-8.0 * dt).exp());
+
+    // Map the lyrics state into the garden view.
+    use crate::garden::GardenState;
+    use crate::lyrics::LyricsStatus;
+
+    let (garden_state, lines, plain, current) = match &state.status {
+        LyricsStatus::Unavailable => (GardenState::Unavailable, None, None, None),
+        LyricsStatus::Loading => (GardenState::Loading, None, None, None),
+        LyricsStatus::Synced(lines) => (GardenState::Synced, Some(lines.clone()), None, {
+            crate::lrc::line_at(lines, snap.position_s)
+        }),
+        LyricsStatus::Plain(text) => (GardenState::Plain, None, Some(text.clone()), None),
+        LyricsStatus::Instrumental => (GardenState::Instrumental, None, None, None),
+        LyricsStatus::NoMatch => (GardenState::NoMatch, None, None, None),
+        LyricsStatus::Error(e) => (GardenState::Error(e.clone()), None, None, None),
+    };
+
+    // Track line changes for the bloom animation.
+    if current != app.lyric_line {
+        app.lyric_line = current;
+        app.lyric_changed_at = Instant::now();
+    }
+    let since = app.lyric_changed_at.elapsed().as_secs_f32();
+
+    let lines_ref = lines.as_deref();
+    let view = crate::garden::GardenView {
+        title: &snap.title,
+        artist: &snap.artist,
+        lines: lines_ref.map(|l| (l, current)),
+        plain: plain.as_deref(),
+        state: garden_state,
+        energy: app.sway_energy.clamp(0.0, 1.0),
+        time_s: snap.position_s as f32,
+        since_line_change: since,
+    };
+    crate::garden::render_garden(buf, area, &view);
+}
+
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {

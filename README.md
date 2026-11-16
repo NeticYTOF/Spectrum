@@ -20,6 +20,11 @@ with Unicode blocks, braille dots and ANSI color.
 - **Spectrogram** - scrolling frequency heatmap, newest at the right edge
 - **Bars + Wave** - oscilloscope overlaid on the spectrum bars
 - **Mirrored spectrum** - bars growing outward from a center line
+- **Lyrics garden** - synced lyrics (LRCLIB, community-sourced) as a
+  dot-matrix garden: the current line in Braille dot text with curling
+  stems and blooming flowers, driven by Windows SMTC metadata; honest
+  states for unsynced/instrumental/no-match/offline, normal-text fallback
+  when narrow
 - **Beat detection** - spectral flux drives a border/`♪` flash
 - **Color themes** - spectrum, fire, ice, matrix, vapor; gradients get a
   deliberate ordered-stipple dither between steps (visible in truecolor,
@@ -68,7 +73,7 @@ spectrum --demo --mode 4 --exit-after 10  # scripted QA / screenshots
 | `-c, --capture` | - | Visualize live audio (see `--source`) |
 | `--demo` | off | Silent synthetic generator; no audio hardware |
 | `--source NAME` | system | `system` (Windows output loopback) or `mic` |
-| `--mode N` | 5 | Start in mode 1-5 (spectrum/scope/spectrogram/combo/mirror); the mirrored spectrum is the default composition |
+| `--mode N` | 5 | Start in mode 1-6 (spectrum/scope/spectrogram/combo/mirror/lyrics); the mirrored spectrum is the default composition |
 | `--exit-after SECS` | - | Exit cleanly after N seconds (scripted QA) |
 | `--freeze-at SECS` | - | With `--demo`: pin the synthetic timeline for deterministic, pixel-identical frames |
 | `-t, --theme NAME` | spectrum | spectrum, fire, ice, matrix, vapor |
@@ -88,7 +93,7 @@ device and any reconnect state).
 
 | Key | Action |
 |---|---|
-| `1`-`5` | spectrum / oscilloscope / spectrogram / combo / mirror |
+| `1`-`6` | spectrum / oscilloscope / spectrogram / combo / mirror / lyrics garden |
 | `Tab` / `Shift+Tab` | cycle visualizations |
 | `Space` | pause / resume audio |
 | `Up` / `Down` | volume (file mode) |
@@ -97,6 +102,29 @@ device and any reconnect state).
 | `t` | cycle color theme |
 | `h` / `?` | help overlay |
 | `q` / `Esc` | quit |
+
+## Lyrics
+
+Mode `6` reads the current track from the Windows System Media Transport
+Controls session (any player that exposes metadata to the OS: title,
+artist, timeline, playing state) and fetches timestamped lyrics from
+LRCLIB, an anonymous, keyless community API. Matching is conservative:
+artist and title must match exactly (version markers like "remix" or
+"feat." are part of the identity and are never stripped), the duration
+must agree within 2 seconds when known, and ambiguous results are rejected
+rather than showing another track. Plain (unsynced) text is shown as
+plain text, never claimed as synced; instrumental, no-match, offline and
+no-session states are labeled honestly. On non-Windows platforms there
+is no OS media API, so the mode shows its unavailable state.
+
+Lyrics are community-sourced; their rights remain with their owners and
+no accuracy or completeness is promised (see NOTICE). `--demo --mode 6`
+renders the same garden from an original fixture track with no network.
+
+The garden's look (paper backdrop, dot-matrix text, curling stems,
+blooming flowers, spring-eased growth) is a terminal port of the design
+of ridit-jangra/ascii-garden (MIT, (c) 2026 Ridit; notice preserved in
+NOTICE), itself a reinterpretation of Akshat Agarwal's Type Garden.
 
 ## Platform notes
 
