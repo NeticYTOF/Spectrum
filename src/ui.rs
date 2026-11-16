@@ -20,7 +20,7 @@ use ratatui::{Frame, Terminal};
 
 use crate::analysis::{FrameAnalysis, SharedState};
 use crate::audio::AudioHandle;
-use crate::theme::{self, Theme};
+use crate::theme::{self, ColorDepth, Theme};
 use crate::visualizers;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -77,12 +77,18 @@ pub struct App {
     scratch: visualizers::RenderScratch,
     themes: Vec<Theme>,
     theme_idx: usize,
+    depth: ColorDepth,
 }
 
 impl App {
-    fn new(shared: &Arc<Mutex<SharedState>>, audio: &AudioHandle, theme_name: &str) -> Self {
+    fn new(
+        shared: &Arc<Mutex<SharedState>>,
+        audio: &AudioHandle,
+        theme_name: &str,
+        depth: ColorDepth,
+    ) -> Self {
         let state = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let themes = theme::all();
+        let themes = theme::all_with_depth(depth);
         let theme_idx = themes
             .iter()
             .position(|t| t.name == theme_name)
@@ -104,6 +110,7 @@ impl App {
             scratch: visualizers::RenderScratch::new(),
             themes,
             theme_idx,
+            depth,
         }
     }
 
@@ -114,7 +121,12 @@ impl App {
 
 /// Run the UI to completion. The terminal is always restored, even on
 /// error or panic (see `install_panic_hook`).
-pub fn run(shared: &Arc<Mutex<SharedState>>, audio: &AudioHandle, theme_name: &str) -> Result<()> {
+pub fn run(
+    shared: &Arc<Mutex<SharedState>>,
+    audio: &AudioHandle,
+    theme_name: &str,
+    depth: ColorDepth,
+) -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
 
@@ -123,7 +135,7 @@ pub fn run(shared: &Arc<Mutex<SharedState>>, audio: &AudioHandle, theme_name: &s
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         terminal.hide_cursor()?;
 
-        let mut app = App::new(shared, audio, theme_name);
+        let mut app = App::new(shared, audio, theme_name, depth);
         let r = event_loop(&mut terminal, shared, audio, &mut app);
 
         let _ = terminal.show_cursor();
@@ -413,7 +425,7 @@ fn status_line(app: &App, audio: &AudioHandle, accent: Color, flux: f32) -> Line
         Style::new().fg(dim),
     ));
     spans.push(Span::styled(
-        format!("[{}] ", app.theme().name),
+        format!("[{}:{}] ", app.theme().name, app.depth.name()),
         Style::new().fg(accent),
     ));
     spans.push(Span::styled(

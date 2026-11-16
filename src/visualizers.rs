@@ -105,13 +105,15 @@ pub fn render_spectrum(
         for j in 0..full.min(h) {
             let y = area.y + (h - 1 - j) as u16;
             let t = (j + 1) as f32 / h as f32;
-            put(buf, area.x + x as u16, y, BLOCKS[7], theme.at(t));
+            let x = area.x + x as u16;
+            put(buf, x, y, BLOCKS[7], theme.at_dither(t, x, y));
         }
         if full < h && frac > 0.06 {
             let y = area.y + (h - 1 - full) as u16;
             let t = (full + 1) as f32 / h as f32;
+            let x = area.x + x as u16;
             let ch = BLOCKS[((frac * 8.0) as usize).min(7)];
-            put(buf, area.x + x as u16, y, ch, theme.at(t));
+            put(buf, x, y, ch, theme.at_dither(t, x, y));
         }
 
         // Peak cap marker.
@@ -119,7 +121,8 @@ pub fn render_spectrum(
         let prow = (peak * h as f32).round() as usize;
         if prow >= 1 && prow <= h {
             let y = area.y + (h - prow) as u16;
-            put(buf, area.x + x as u16, y, '\u{2594}', theme.at(1.0));
+            let x = area.x + x as u16;
+            put(buf, x, y, '\u{2594}', theme.at_dither(1.0, x, y));
         }
     }
 }
@@ -197,7 +200,7 @@ pub fn render_oscilloscope(
                 area.x + gx as u16,
                 area.y + gy as u16,
                 ch,
-                theme.at(dist),
+                theme.at_dither(dist, area.x + gx as u16, area.y + gy as u16),
             );
         }
     }
@@ -239,7 +242,7 @@ pub fn render_spectrogram(
                 continue;
             }
             if let Some(cell) = buf.cell_mut(Position::new(area.x + x as u16, area.y + y as u16)) {
-                cell.set_bg(theme.at(v));
+                cell.set_bg(theme.at_dither(v, area.x + x as u16, area.y + y as u16));
             }
         }
     }
