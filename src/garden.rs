@@ -748,25 +748,28 @@ fn render_matrix_band(buf: &mut Buffer, area: Rect, text: &str, view: &GardenVie
     }
 
     // Pick the biggest scale that fits on one line; wrap when needed.
-    let mut scale = 2;
-    let mut lines = vec![text.to_string()];
-    while scale >= 1 {
-        if line_width(text, scale) <= sub_w.saturating_sub(4) {
-            break; // fits on one line at this scale
+    // The text block may take at most about half the band so the garden
+    // keeps real headroom; larger scales are preferred (readability).
+    let band_h_sub = area.height as usize * 4;
+    let max_w = sub_w.saturating_sub(4);
+    let mut scale = 1;
+    let mut lines = wrap_matrix_lines(text, 1, max_w);
+    'pick: for max_lines in [2usize, 3] {
+        for s in (1..=4usize).rev() {
+            let wrapped = if line_width(text, s) <= max_w {
+                vec![text.to_string()]
+            } else {
+                wrap_matrix_lines(text, s, max_w)
+            };
+            if wrapped.len() <= max_lines && wrapped.len() * 6 * s <= band_h_sub / 2 {
+                scale = s;
+                lines = wrapped;
+                break 'pick;
+            }
         }
-        let wrapped = wrap_matrix_lines(text, scale, sub_w.saturating_sub(4));
-        if wrapped.len() <= 3 {
-            lines = wrapped;
-            break;
-        }
-        scale -= 1;
     }
-    if scale == 0 {
-        scale = 1;
-        lines = wrap_matrix_lines(text, 1, sub_w.saturating_sub(4));
-        if lines.len() > 3 {
-            lines.truncate(3);
-        }
+    if lines.len() > 3 {
+        lines.truncate(3);
     }
 
     // Layout: the matrix sits in the LOWER two-thirds of the band so the
@@ -783,7 +786,7 @@ fn render_matrix_band(buf: &mut Buffer, area: Rect, text: &str, view: &GardenVie
         (canvas_h.saturating_sub(line_h_sub)) as i32
     }
     .max(5 * scale as i32)
-    .min((canvas_h.saturating_sub(line_h_sub)) as i32)
+    .min((canvas_h.saturating_sub(total_h_sub)) as i32)
     .max(0);
 
     let mut canvas = DotCanvas::new(sub_w, canvas_h);

@@ -823,6 +823,46 @@ mod tests {
     /// The gate itself must stay strict: a real track change with no
     /// matching lyrics state still shows Loading, never stale fixture words.
     #[test]
+    #[ignore]
+    fn dump_garden_layout() {
+        let media = crate::media::new_shared();
+        let lyrics = crate::lyrics::new_shared();
+        demo::seed_demo_state(&media, &lyrics, 4.5, true);
+        for (w, h) in [(144u16, 42u16), (72, 22)] {
+            let mut app = demo_app();
+            let area = ratatui::layout::Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            render_lyrics(
+                &mut buf,
+                area,
+                &mut app,
+                &FrameAnalysis::quiet(64),
+                &media,
+                &lyrics,
+                0.016,
+            );
+            for y in 0..h {
+                let mut row = String::new();
+                for x in 0..w {
+                    let c = &buf[(x, y)];
+                    let s = c.symbol();
+                    row.push(if s == " " {
+                        ' '
+                    } else {
+                        match c.fg {
+                            Color::Rgb(28, 43, 143) | Color::Rgb(90, 112, 200) => 'b',
+                            Color::Rgb(232, 61, 95) | Color::Rgb(255, 210, 196) => 'p',
+                            _ => '#',
+                        }
+                    });
+                }
+                println!("{}", row.trim_end());
+            }
+            println!("=====");
+        }
+    }
+
+    #[test]
     fn identity_gate_still_blocks_mismatched_state() {
         let media = crate::media::new_shared();
         let lyrics = crate::lyrics::new_shared();
