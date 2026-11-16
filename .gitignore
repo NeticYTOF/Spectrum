@@ -19,3 +19,4 @@ Desktop.ini
 
 # Rust build artifacts
 /target
+shots/
