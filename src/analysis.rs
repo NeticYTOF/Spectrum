@@ -86,6 +86,7 @@ pub struct Analyzer {
     mags: Vec<f32>,
     prev_mags: Vec<f32>,
     band_bins: Vec<(usize, usize)>,
+    targets: Vec<f32>,
     flux_hist: VecDeque<f32>,
     bars: Vec<f32>,
     spectrum: Vec<f32>,
@@ -136,6 +137,7 @@ impl Analyzer {
             mags: vec![0.0; bins],
             prev_mags: vec![0.0; bins],
             band_bins,
+            targets: vec![0.0; bands],
             flux_hist: VecDeque::with_capacity(FLUX_HISTORY),
             bars: vec![0.0; bands],
             spectrum: vec![0.0; bands],
@@ -193,8 +195,7 @@ impl Analyzer {
             self.mags[k] = (c.re * c.re + c.im * c.im).sqrt() * (2.0 / FFT_SIZE as f32);
         }
 
-        // Per-band values, computed into a temp so borrows stay disjoint.
-        let mut targets = vec![0.0f32; self.bands];
+        // Per-band values, reused across ticks to stay allocation-free.
         for i in 0..self.bands {
             let (b0, b1) = self.band_bins[i];
             let mut best = 0.0f32;
@@ -203,10 +204,10 @@ impl Analyzer {
                     best = self.mags[k];
                 }
             }
-            targets[i] = norm(best, params.sensitivity);
+            self.targets[i] = norm(best, params.sensitivity);
         }
         for i in 0..self.bands {
-            let target = targets[i];
+            let target = self.targets[i];
             let cur = self.bars[i];
             // Asymmetric smoothing: bars jump up fast, fall gracefully.
             self.bars[i] = if target >= cur {
