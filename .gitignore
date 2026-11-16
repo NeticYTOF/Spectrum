@@ -16,3 +16,6 @@ Desktop.ini
 # Environment
 .env
 .env.local
+
+# Rust build artifacts
+/target
