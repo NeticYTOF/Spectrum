@@ -1,11 +1,111 @@
-# Spectrum
+# SPECTRUM
 
-A placeholder description for the Spectrum project.
+A terminal-native audio visualizer written in Rust. Play a local audio file
+or capture live audio and watch it as real-time FFT visualizations rendered
+with Unicode blocks, braille dots and ANSI color.
 
-## Getting Started
+```
+ ▄▄                    ▄▄
+ ██ ▀▀▀█▄   ▄▄▄▄▄▄▄▄▄▄ ██   ▄▄▄▄
+ ████████ ▄▄███████████▀▀  ▄▄████
+ ███████████████████████████████▀
+```
 
-TODO: Add setup and usage instructions.
+## Features
+
+- **Spectrum analyzer** - log-spaced frequency bars with partial-block
+  tops and peak-hold caps
+- **Oscilloscope** - phase-triggered braille waveform (2x4 dot
+  resolution per cell)
+- **Spectrogram** - scrolling frequency heatmap, newest at the right edge
+- **Bars + Wave** - oscilloscope overlaid on the spectrum bars
+- **Mirrored spectrum** - bars growing outward from a center line
+- **Beat detection** - spectral flux drives a border/`♪` flash
+- **Color themes** - spectrum, fire, ice, matrix, vapor; gradients map to
+  your terminal's color depth with optional ordered dithering
+- **Live tuning** - sensitivity, smoothing and volume adjustable while
+  running; all animation is frame-rate independent
+
+## Install
+
+Requires [Rust](https://rustup.rs) 1.74 or newer.
+
+```
+git clone https://github.com/NeticYTOF/Spectrum.git
+cd Spectrum
+cargo build --release
+```
+
+Use `cargo build --release -j 2` if you want to bound build-time memory.
+
+A truecolor terminal is recommended (Windows Terminal, WezTerm, kitty,
+iTerm2, Alacritty, modern gnome-terminal). On 256/16-color terminals run
+with `--colors 256` or `--colors 16` for quantized gradients with ordered
+dithering.
+
+## Usage
+
+```
+# Play and visualize a file (mp3, wav, ogg vorbis, flac)
+spectrum song.mp3
+
+# Visualize live audio instead
+spectrum --capture
+
+# With options
+spectrum song.mp3 --theme fire --bars 96 --sensitivity 1.4
+spectrum --capture --colors 16
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `FILE` | - | Audio file to play and visualize |
+| `-c, --capture` | off | Visualize live audio instead of playing a file |
+| `-t, --theme NAME` | spectrum | spectrum, fire, ice, matrix, vapor |
+| `--bars N` | 64 | Frequency bands (8..=256) |
+| `--sensitivity F` | 1.0 | FFT display gain (0.1..=4.0, must be finite) |
+| `--smoothing F` | 0.12 | Bar fall speed (0.01 slow .. 0.95 instant) |
+| `--colors MODE` | true | true (24-bit), 256 or 16 (both dithered) |
+
+## Controls
+
+| Key | Action |
+|---|---|
+| `1`-`5` | spectrum / oscilloscope / spectrogram / combo / mirror |
+| `Tab` / `Shift+Tab` | cycle visualizations |
+| `Space` | pause / resume audio |
+| `Up` / `Down` | volume (file mode) |
+| `+` / `-` | sensitivity |
+| `[` / `]` | bar smoothing (fall speed) |
+| `t` | cycle color theme |
+| `h` / `?` | help overlay |
+| `q` / `Esc` | quit |
+
+## Platform notes
+
+- **Windows**: `--capture` opens the default *output* device as a WASAPI
+  loopback input, visualizing whatever the system is playing; it falls
+  back to the microphone when loopback is unavailable.
+- **Linux**: capture uses the default input device - select a PulseAudio
+  or PipeWire *monitor* source to visualize system playback.
+- **macOS**: only microphone capture is supported (CoreAudio exposes no
+  system loopback).
+- Playback uses rodio; decoding supports mp3, wav, ogg vorbis and flac.
+
+## Development
+
+```
+cargo test                 # unit + regression tests
+cargo clippy               # lint (kept warning-free)
+cargo run --example preview  # headless visual check of all renderers
+cargo run -- song.mp3      # run from source
+```
+
+Architecture: `audio` (playback tap + capture) feeds a lock-batched sample
+queue to `analysis` (Hann-windowed FFT, log bands, spectral-flux beat
+detection, waveform trigger) on its own thread; `ui` renders with ratatui
+using allocation-free hot paths and shared-frame `Arc` handoff.
 
 ## License
 
-TODO: Add license information.
+MIT
