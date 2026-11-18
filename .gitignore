@@ -1,23 +1,17 @@
-# OS files
-.DS_Store
-Thumbs.db
-Desktop.ini
-
-# Editors
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Logs
-*.log
-
-# Environment
-.env
-.env.local
-
-# Rust build artifacts
 /target
-shots/
-.qa-local/
+/target-qa
+*.exe
+.zed
+.qa-local
+terminal/ProfileIcons
+terminal/Images
+terminal/Microsoft.UI.Xaml
+terminal/ProfileGeneratorIcons
+terminal/*.dll
+terminal/*.pri
+terminal/*.ttf
+terminal/OpenConsole*.exe
+terminal/elevate-shim.exe
+terminal/defaults.json
+terminal/NOTICE.html
+terminal/settings/state.json

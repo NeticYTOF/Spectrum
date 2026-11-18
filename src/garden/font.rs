@@ -74,6 +74,29 @@ pub struct Metrics {
     pub descender: f32,
 }
 
+/// The glyph's actual INK extent in em, y-up: (top, bottom) - measured
+/// per glyph from the embedded Playfair (the 'h' ink top is ~0.782, NOT
+/// the em-box ascender ~0.96; x-height letters ~0.52; descenders go
+/// negative). Used for whole-bloom clearance: flowers must clear the
+/// letter's real ink shape, not a bounding-box guess.
+pub fn ink_extent(c: char) -> (f32, f32) {
+    match glyph_id(c) {
+        Some(id) => {
+            let u = upem();
+            font()
+                .outline(id)
+                .map(|o| {
+                    (
+                        o.bounds.min.y.max(o.bounds.max.y) / u,
+                        o.bounds.min.y.min(o.bounds.max.y) / u,
+                    )
+                })
+                .unwrap_or((0.517, -0.2))
+        }
+        None => (0.517, -0.2),
+    }
+}
+
 pub fn metrics() -> Metrics {
     let f = font();
     let u = upem();
@@ -105,8 +128,14 @@ pub struct TypeMask {
     pub cov: Vec<u8>,
     /// Owning line (index + 1) of each covered subpixel.
     pub line: Vec<u8>,
+    /// Owning LETTER (scene index + 1; 0 = none) of each covered
+    /// subpixel - per-letter identity, separate from the line tag: the
+    /// line-based owner cannot audit EACH letter's cover budget.
+    pub letter: Vec<u16>,
     /// Line tag applied by subsequent `draw_glyph` calls.
     pub current_line: u8,
+    /// Letter tag applied by subsequent `draw_glyph` calls.
+    pub current_letter: u16,
 }
 
 impl TypeMask {
@@ -116,7 +145,9 @@ impl TypeMask {
             h,
             cov: vec![0; w * h],
             line: vec![0; w * h],
+            letter: vec![0; w * h],
             current_line: 1,
+            current_letter: 0,
         }
     }
 
@@ -162,6 +193,7 @@ impl TypeMask {
             if v > self.cov[k] {
                 self.cov[k] = v;
                 self.line[k] = tag;
+                self.letter[k] = self.current_letter;
             }
         });
     }
@@ -179,6 +211,45 @@ mod tests {
         assert!((m.cap_height - 0.708).abs() < 0.02, "cap {}", m.cap_height);
         assert!(m.ascender > m.cap_height);
         assert!(m.descender < -0.1);
+    }
+
+    #[test]
+    fn ink_extent_tracks_each_glyphs_real_shape() {
+        // Per-glyph ink, with GENUINE font relationships (no fabricated
+        // magnitudes): 'h' ink tops ABOVE cap height but BELOW the
+        // em-box ascender (measured 0.782); x-height letters top near
+        // the x-height; 'g' dips below the baseline. The whole-bloom
+        // clearance targets THESE per-letter shapes, not one bound.
+        let m = metrics();
+        let (h_top, h_bot) = ink_extent('h');
+        let (x_top, _) = ink_extent('x');
+        let (g_top, g_bot) = ink_extent('g');
+        let (o_top, o_bot) = ink_extent('o');
+        // 'h' ink (ascender) vs the font's own measured metrics.
+        assert!(
+            (h_top - m.ascender).abs() < 0.005,
+            "h ink top {h_top} vs metrics ascender {}",
+            m.ascender
+        );
+        assert!(
+            h_top > m.cap_height,
+            "ascender h {h_top} must top caps {}",
+            m.cap_height
+        );
+        assert!(
+            h_top < 0.85,
+            "h ink top {h_top} is ink, not the em-box ascender"
+        );
+        assert!(
+            (x_top - m.x_height).abs() < 0.02,
+            "x top {x_top} vs x-height {}",
+            m.x_height
+        );
+        assert!((o_top - m.x_height).abs() < 0.05, "o top {o_top}");
+        assert!(g_bot < -0.1, "descender g bottom {g_bot}");
+        assert!(o_bot > -0.06 && o_bot < 0.02, "o bottom {o_bot}");
+        assert!(g_top < h_top, "g must not top the ascender h");
+        assert!(h_bot > -0.06, "h sits on the baseline: bottom {h_bot}");
     }
 
     #[test]

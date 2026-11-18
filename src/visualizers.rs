@@ -7,16 +7,12 @@
 //!   peak caps, a true log-frequency axis;
 //! - oscilloscope: a connected braille trace with time-based phosphor
 //!   persistence over a quiet graticule;
-//! - spectrogram: half-block cells (two frequency rows per cell, each
-//!   with its own colour), frequency labels;
 //! - radial: spectrum petals around a waveform ring;
 //! - mirror: centre-out symmetric bars (bass in the middle), mirrored
 //!   vertically with a dimmer reflection.
 //!
 //! All motion is time-based (`dt` in seconds); nothing depends on the
 //! frame rate, and every renderer tolerates empty input and tiny areas.
-
-use std::collections::VecDeque;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -724,59 +720,9 @@ pub fn render_mirror(
 }
 
 // ----------------------------------------------------------- spectrogram
-
-/// Scrolling spectrogram (waterfall): newest column at the right edge,
-/// low frequencies at the bottom, two frequency rows per cell via an
-/// upper-half block with independent fg/bg colours.
-pub fn render_spectrogram(
-    buf: &mut Buffer,
-    area: Rect,
-    columns: &VecDeque<Vec<f32>>,
-    theme: &Theme,
-) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    paint_canvas(buf, area, theme);
-    let bg = canvas(theme);
-    let w = area.width as usize;
-    let h = area.height as usize;
-    let rows = h * 2;
-    let level = |v: f32| v.clamp(0.0, 1.0).powf(0.85);
-    for x in 0..w {
-        let idx = columns.len() as isize - w as isize + x as isize;
-        let Some(col) = usize::try_from(idx).ok().and_then(|i| columns.get(i)) else {
-            continue;
-        };
-        for y in 0..h {
-            let t_top = 1.0 - (2 * y) as f32 / (rows - 1).max(1) as f32;
-            let t_bot = 1.0 - (2 * y + 1) as f32 / (rows - 1).max(1) as f32;
-            let (vt, vb) = (level(sample_at(col, t_top)), level(sample_at(col, t_bot)));
-            let (sx, sy) = (area.x + x as u16, area.y + y as u16);
-            let ct = if vt < 0.04 {
-                bg
-            } else {
-                theme.at_dither(vt, sx, sy)
-            };
-            let cb = if vb < 0.04 {
-                bg
-            } else {
-                theme.at_dither(vb, sx, sy)
-            };
-            if let Some(c) = cell(buf, sx, sy) {
-                c.set_char('\u{2580}').set_fg(ct).set_bg(cb);
-            }
-        }
-    }
-    if area.width >= 60 && area.height >= 10 {
-        let dim = theme.at(0.5);
-        for (hz, label) in [(100.0, "100"), (1000.0, "1k"), (10000.0, "10k")] {
-            let t = freq_t(hz);
-            let y = area.y + ((1.0 - t) * (h - 1) as f32).round() as u16;
-            put_str(buf, area.x, y, label, dim, bg, area.x + area.width);
-        }
-    }
-}
+// REMOVED: the waterfall visualization was deleted from the mode set at
+// the maintainer's request (mode cycling, keys, help and docs no longer
+// reference it). Nothing here remains to render it.
 
 #[cfg(test)]
 mod tests {
@@ -1040,8 +986,6 @@ mod tests {
             &theme,
             &mut s,
         );
-        let cols: VecDeque<Vec<f32>> = VecDeque::new();
-        render_spectrogram(&mut buf, Rect::new(0, 0, 4, 3), &cols, &theme);
     }
 
     #[test]
@@ -1064,19 +1008,6 @@ mod tests {
             .map(|x| buf[(x, 13)].symbol().to_string())
             .collect();
         assert!(axis.contains("1k"), "axis labels missing: {axis:?}");
-    }
-
-    #[test]
-    fn spectrogram_uses_two_rows_per_cell() {
-        let theme = crate::theme::find("spectrum").unwrap();
-        let area = Rect::new(0, 0, 4, 3);
-        let mut buf = Buffer::empty(area);
-        let mut cols = VecDeque::new();
-        cols.push_back((0..64).map(|i| i as f32 / 63.0).collect::<Vec<f32>>());
-        render_spectrogram(&mut buf, area, &cols, &theme);
-        let c = &buf[(3, 1)];
-        assert_eq!(c.symbol(), "\u{2580}");
-        assert_ne!(c.fg, c.bg, "top and bottom halves carry distinct rows");
     }
 
     #[test]

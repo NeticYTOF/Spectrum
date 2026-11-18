@@ -9,13 +9,12 @@ this file preserves their notices as required.
 
 ascii-garden by Ridit (https://github.com/ridit-jangra/ascii-garden)
 
-The lyrics garden mode ("6") is a direct port of the rendering
+The lyrics garden mode ("5") is a direct port of the rendering
 algorithms of ascii-garden at revision
 f519e85f12a8e47b6c7b73a0d13a85043dedbc40: the role/coverage
 classifier, glyph families, subpixel mask rasterization, letter
 layout and wrap, stem/leaf/rose geometry and growth parameters, sway
-and the "Paper" palette, adapted from Canvas to terminal cells as
-documented in docs/PORT-PLAN.md. ascii-garden is itself a
+and the "Paper" palette, adapted from Canvas to terminal cells. ascii-garden is itself a
 reinterpretation of Akshat Agarwal's Type Garden, and its cell-grid
 ASCII approach is adapted from ascii-animals by drewdi /
 DesignerStephen1; those works keep their own licences and copyrights.
@@ -70,10 +69,3 @@ ab_glyph (https://github.com/alexheretic/ab_glyph), used to rasterize the
 font, is Apache-2.0 licensed and distributed through crates.io.
 
 -------------------------------------------------------------------------------
-
-Lyrics content note: lyrics fetched via LRCLIB (https://lrclib.net) are
-community-sourced. LRCLIB's software license does NOT license any lyric
-content. Lyric rights remain with their respective owners; availability
-and accuracy are not guaranteed, and nothing in this project provides any
-legal assurance regarding that content. The demo mode ships only original
-fixture text written for this project.

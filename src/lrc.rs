@@ -1,11 +1,9 @@
-//! Timestamped LRC parsing and track-identity matching (pure, testable).
+//! Timestamped LRC parsing for sidecar lyric files (pure, testable).
 //!
-//! LRCLIB (https://lrclib.net) is an anonymous, keyless lyrics API. The
-//! content it returns is community-sourced; matching here is deliberately
-//! conservative: we require artist AND title identity and (when both
-//! durations are known) agreement within 2 seconds, and we reject ambiguity
-//! rather than show lyrics for another track. Version markers ("remix",
-//! "live", "feat.") are preserved verbatim - they are part of the identity.
+//! Lyrics are LOCAL sidecar files: the same-basename `.lrc` next to the
+//! audio file (song.mp3 -> song.lrc). Nothing is fetched, nothing is
+//! guessed: plain line LRC carries LINE timing only - no word-level
+//! onsets exist, so none are ever invented.
 
 /// One synced lyric line.
 #[derive(Clone, Debug, PartialEq)]
@@ -15,42 +13,17 @@ pub struct LrcLine {
     pub text: String,
 }
 
-/// Normalized comparison: lowercase + collapsed whitespace. Nothing is
-/// stripped - version text like "(remix)" or "feat." stays part of the
-/// identity, so a different version of the same song does not match.
-pub fn normalize(s: &str) -> String {
-    s.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-/// Identity check for artist and title together.
-pub fn identity_matches(
-    query_artist: &str,
-    query_title: &str,
-    found_artist: &str,
-    found_title: &str,
-) -> bool {
-    normalize(query_artist) == normalize(found_artist)
-        && normalize(query_title) == normalize(found_title)
-}
-
-/// Duration safeguard: both known and within 2 seconds.
-pub fn duration_matches(query: Option<f64>, found: Option<f64>) -> bool {
-    match (query, found) {
-        (Some(q), Some(f)) => (q - f).abs() <= 2.0,
-        _ => true,
-    }
-}
-
 /// Parse a timestamp like `12:34.56`, `12:34.5`, `12:34` into seconds.
+/// Malformed values are REJECTED (None), never parsed into something
+/// that masquerades as synced: negative, NaN or infinite minutes or
+/// seconds are all invalid (QA 1732 - bounded malformed-input
+/// rejection, not a feature).
 fn parse_timestamp(s: &str) -> Option<f64> {
     let mut parts = s.splitn(2, ':');
     let min: f64 = parts.next()?.trim().parse().ok()?;
     let rest = parts.next()?;
     let sec: f64 = rest.trim().parse().ok()?;
-    if !(0.0..60.0).contains(&sec) {
+    if !min.is_finite() || min < 0.0 || !(0.0..60.0).contains(&sec) {
         return None;
     }
     Some(min * 60.0 + sec)
@@ -63,8 +36,9 @@ fn parse_timestamp(s: &str) -> Option<f64> {
 ///   per the common LRC convention `display = timestamp - offset`)
 /// - malformed lines without a valid tag (skipped)
 ///
-/// Returns None when the document has no timestamped lines at all (callers
-/// treat that as unsynced plain text).
+/// Returns None when the document has no timestamped lines at all (the
+/// caller reports the sidecar as malformed honestly - never rendered
+/// as if it were synced).
 pub fn parse_lrc(input: &str) -> Option<Vec<LrcLine>> {
     let mut offset_ms = 0.0f64;
     let mut lines: Vec<LrcLine> = Vec::new();
@@ -87,7 +61,9 @@ pub fn parse_lrc(input: &str) -> Option<Vec<LrcLine>> {
                     stamps.push(t);
                 } else if let Some(v) = tag.strip_prefix("offset:") {
                     if let Ok(v) = v.trim().parse::<f64>() {
-                        offset_ms = v;
+                        if v.is_finite() {
+                            offset_ms = v;
+                        }
                     }
                 }
                 // Other meta tags (ti:, ar:, al:, by:, ...) are ignored.
@@ -96,18 +72,27 @@ pub fn parse_lrc(input: &str) -> Option<Vec<LrcLine>> {
         }
         let text = rest.trim().to_string();
         for t in stamps {
-            let time = (t - offset_ms / 1000.0).max(0.0);
-            lines.push(LrcLine {
-                time_s: time,
-                text: text.clone(),
-            });
+            // The offset tag is parsed with the same honesty: a NaN or
+            // infinite offset would poison every line's time; an
+            // UNPARSEABLE offset tag is simply ignored (the line keeps
+            // its raw stamp), while a parseable-but-non-finite one must
+            // not masquerade as sync data.
+            if t.is_finite() {
+                let time = (t - offset_ms / 1000.0).max(0.0);
+                lines.push(LrcLine {
+                    time_s: time,
+                    text: text.clone(),
+                });
+            }
         }
     }
 
     if lines.is_empty() {
         return None;
     }
-    lines.sort_by(|a, b| a.time_s.partial_cmp(&b.time_s).unwrap());
+    // total_cmp: the IEEE-754 total order - panic-free even if some
+    // path ever feeds a non-finite time (defense in depth).
+    lines.sort_by(|a, b| a.time_s.total_cmp(&b.time_s));
     // Deduplicate identical (time, text) pairs that multi-stamp lines can
     // produce with zero-length repeats.
     lines.dedup_by(|a, b| a.time_s == b.time_s && a.text == b.text);
@@ -116,7 +101,7 @@ pub fn parse_lrc(input: &str) -> Option<Vec<LrcLine>> {
 
 /// The lyric line active at `position_s`: the last line at or before it.
 pub fn line_at(lines: &[LrcLine], position_s: f64) -> Option<usize> {
-    match lines.binary_search_by(|l| l.time_s.partial_cmp(&position_s).unwrap()) {
+    match lines.binary_search_by(|l| l.time_s.total_cmp(&position_s)) {
         Ok(i) => Some(i),
         Err(0) => None,
         Err(i) => Some(i - 1),
@@ -181,6 +166,46 @@ mod tests {
         assert_eq!(lines.len(), 2);
     }
 
+    // QA 1732: malformed timestamps must be REJECTED (skipped), never
+    // parsed into a panic or a fake-synced line.
+    #[test]
+    fn malformed_timestamps_are_rejected_not_parsed() {
+        // Negative minutes are invalid.
+        assert!(parse_lrc("[-1:30.0]no\n[00:02.0]yes\n").unwrap().len() == 1);
+        // NaN / inf minutes are invalid (the f64 parse succeeds, the
+        // value is still rejected).
+        assert!(parse_lrc("[NaN:30.0]no\n[00:02.0]yes\n").unwrap().len() == 1);
+        assert!(parse_lrc("[inf:30.0]no\n[00:02.0]yes\n").unwrap().len() == 1);
+        // Negative / NaN / infinite seconds are invalid.
+        assert!(parse_lrc("[00:-1.0]no\n[00:02.0]yes\n").unwrap().len() == 1);
+        assert!(parse_lrc("[00:NaN]no\n[00:02.0]yes\n").unwrap().len() == 1);
+        assert!(parse_lrc("[00:inf]no\n[00:02.0]yes\n").unwrap().len() == 1);
+        // A NaN offset tag is ignored (never poisons the stamps); the
+        // valid lines stay synced at their raw stamps.
+        let lrc = "[offset:NaN]\n[00:10.00]kept\n";
+        let lines = parse_lrc(lrc).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!((lines[0].time_s - 10.0).abs() < 1e-9);
+        // An infinite offset tag is ignored the same way.
+        let lrc = "[offset:inf]\n[00:10.00]kept\n";
+        let lines = parse_lrc(lrc).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!((lines[0].time_s - 10.0).abs() < 1e-9);
+        // A document with ONLY malformed stamps is NOT synced (None).
+        assert!(parse_lrc("[NaN:NaN]no\n[-5:-5]no\n").is_none());
+        // No panic on any of it: the sort is total_cmp (IEEE-754 total
+        // order) and rejects happen before any stamp is stored.
+    }
+
+    #[test]
+    fn huge_finite_minutes_do_not_overflow_into_inf() {
+        // 1e308 minutes * 60 = inf seconds: the stamp is dropped, the
+        // valid line stays, no inf time masquerades as synced.
+        let lines = parse_lrc("[1e308:00.0]no\n[00:02.0]yes\n").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].time_s.is_finite());
+    }
+
     #[test]
     fn line_at_finds_current() {
         let lines = parse_lrc("[00:01]a\n[00:05]b\n[00:10]c\n").unwrap();
@@ -189,46 +214,5 @@ mod tests {
         assert_eq!(line_at(&lines, 4.9), Some(0));
         assert_eq!(line_at(&lines, 5.0), Some(1));
         assert_eq!(line_at(&lines, 999.0), Some(2), "holds the last line");
-    }
-
-    #[test]
-    fn identity_matching_preserves_versions() {
-        // Exact match.
-        assert!(identity_matches("Artist", "Song", "artist", "SONG"));
-        // Whitespace/case-insensitive.
-        assert!(identity_matches(
-            " The  Artist ",
-            "Song",
-            "the artist",
-            "song"
-        ));
-        // A remix does NOT match the base title (and vice versa).
-        assert!(!identity_matches(
-            "Artist",
-            "Song",
-            "Artist",
-            "Song (remix)"
-        ));
-        assert!(!identity_matches("Artist", "Song - Live", "Artist", "Song"));
-        // Featuring artists stay part of the identity.
-        assert!(!identity_matches("A feat. B", "Song", "A", "Song"));
-        // Wrong artist.
-        assert!(!identity_matches("Artist", "Song", "Other", "Song"));
-    }
-
-    #[test]
-    fn duration_safeguard() {
-        assert!(duration_matches(Some(180.0), Some(181.5)));
-        assert!(duration_matches(Some(180.0), Some(178.0)));
-        assert!(
-            duration_matches(Some(180.0), Some(182.0)),
-            "exactly 2s is within"
-        );
-        assert!(!duration_matches(Some(180.0), Some(182.1)));
-        assert!(
-            duration_matches(Some(180.0), None),
-            "unknown duration passes"
-        );
-        assert!(duration_matches(None, None));
     }
 }

@@ -1,0 +1,185 @@
+{
+    "$help": "https://aka.ms/terminal-documentation",
+    "$schema": "https://aka.ms/terminal-profiles-schema",
+    "actions": [],
+    "defaultProfile": "{b8f1c3d2-9a4e-5e6f-8b2a-3c5d7e9f1a4b}",
+    "disabledProfileSources":
+    [
+        "Windows.Terminal.Wsl",
+        "Windows.Terminal.Azure",
+        "Windows.Terminal.PowershellCore",
+        "Windows.Terminal.SSH"
+    ],
+    "keybindings":
+    [
+        {
+            "id": null,
+            "keys": "ctrl+t"
+        },
+        {
+            "id": null,
+            "keys": "alt+down"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+shift+t"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+shift+n"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+shift+space"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+shift+p"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+shift+f"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+comma"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+alt+comma"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+shift+comma"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+shift+tab"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+shift+d"
+        },
+        {
+            "id": null,
+            "keys": "alt+shift+d"
+        },
+        {
+            "id": null,
+            "keys": "alt+shift+minus"
+        },
+        {
+            "id": null,
+            "keys": "alt+space"
+        },
+        {
+            "id": null,
+            "keys": "alt+shift+plus"
+        },
+        {
+            "id": null,
+            "keys": "alt+shift+f10"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+shift+w"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+shift+enter"
+        },
+        {
+            "id": null,
+            "keys": "alt+enter"
+        },
+        {
+            "id": null,
+            "keys": "f11"
+        },
+        {
+            "id": null,
+            "keys": "alt+up"
+        },
+        {
+            "id": null,
+            "keys": "alt+left"
+        },
+        {
+            "id": null,
+            "keys": "alt+right"
+        },
+        {
+            "id": null,
+            "keys": "ctrl+tab"
+        },
+        {
+            "id": null,
+            "keys": "alt+shift+down"
+        },
+        {
+            "id": null,
+            "keys": "alt+shift+up"
+        },
+        {
+            "id": null,
+            "keys": "alt+shift+left"
+        },
+        {
+            "id": null,
+            "keys": "alt+shift+right"
+        }
+    ],
+    "launchMode": "fullscreen",
+    "newTabMenu": [],
+    "profiles":
+    {
+        "defaults":
+        {
+            "closeOnExit": "always",
+            "suppressApplicationTitle": true
+        },
+        "list":
+        [
+            {
+                "commandline": "spectrum-app.exe",
+                "environment":
+                {
+                    "SPECTRUM_OWN_TERM": "menu"
+                },
+                "font":
+                {
+                    "face": "Cascadia Mono",
+                    "size": 11
+                },
+                "guid": "{b8f1c3d2-9a4e-5e6f-8b2a-3c5d7e9f1a4b}",
+                "name": "Spectrum Menu"
+            },
+            {
+                "commandline": "spectrum-app.exe",
+                "environment":
+                {
+                    "SPECTRUM_OWN_TERM": "garden"
+                },
+                "font":
+                {
+                    "face": "Cascadia Mono",
+                    "size": 6
+                },
+                "guid": "{e7a9d4c3-1b5f-4f8e-a2d9-6c8e0b2a4d6f}",
+                "name": "Spectrum Garden"
+            },
+            {
+                "guid": "{61c54bbd-c2c6-5271-96e7-009a87ff44bf}",
+                "hidden": true,
+                "name": "Windows PowerShell"
+            },
+            {
+                "guid": "{0caa0dad-35be-5f56-a8ff-afceeeaa6101}",
+                "hidden": true,
+                "name": "Command Prompt"
+            }
+        ]
+    },
+    "schemes": [],
+    "themes": []
+}

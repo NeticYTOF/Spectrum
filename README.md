@@ -1,8 +1,6 @@
 # SPECTRUM
 
-A terminal-native audio visualizer written in Rust. Play a local audio file
-or capture live audio and watch it as real-time FFT visualizations rendered
-with Unicode blocks, braille dots and ANSI color.
+A terminal audio visualizer written in Rust. Play a local audio file or capture live audio and watch it as real time FFT visualizations rendered with Unicode blocks braille dots and ANSI color.
 
 ```
  ▄▄                    ▄▄
@@ -11,170 +9,112 @@ with Unicode blocks, braille dots and ANSI color.
  ███████████████████████████████▀
 ```
 
-## Features
+## How to run
 
-- **Spectrum** (1) - separated log-frequency bars with eighth-block
-  anti-aliased tops, gravity peak caps and a true frequency axis
-- **Oscilloscope** (2) - phase-triggered, connected braille trace with
-  time-based phosphor persistence over a quiet graticule
-- **Waterfall** (3) - scrolling spectrogram, two frequency rows per
-  cell (half blocks with independent colours), frequency labels
-- **Radial** (4) - spectrum petals as solid wedges around a waveform
-  ring that breathes with the music
-- **Mirror** (5, default) - centre-out symmetric bars (bass in the
-  middle) mirrored around a centre line with a dimmer reflection
-- **Lyrics garden** - synced lyrics (LRCLIB, community-sourced) as an
-  ASCII garden: the current line in serif type with curling stems,
-  leaves and shaded roses growing out of the letters, driven by Windows
-  SMTC metadata; honest states for unsynced/instrumental/no-match/
-  offline, normal-text fallback for unsupported scripts
-- **Beat detection** - spectral flux drives a glowing beat dot in the
-  header
-- **Motion** - attack/release display smoothing, gravity peaks and
-  phosphor decay are all time-based, so motion is identical at any
-  frame rate
-- **Color themes** - spectrum, fire, ice, matrix, vapor; gradients get a
-  deliberate ordered-stipple dither between steps (visible in truecolor,
-  consistent in 256/16)
-- **Live tuning** - sensitivity, smoothing and volume adjustable while
-  running; all animation is frame-rate independent
+### Windows
 
-## Install
+Just double tap on `spectrum-app.exe`. Thats it.
 
-Requires [Rust](https://rustup.rs) 1.74 or newer.
+Youll get a choise: pick `1) Own terminal` for the best experiance or `2) Normal terminal` to run in whatever terminal you already have open.
 
-```
+The own terminal opens fullscreen with a readable menu. Pick what you want from the numbered options and it just works.
+
+### Linux
+
+Build from source:
+
+```bash
 git clone https://github.com/NeticYTOF/Spectrum.git
 cd Spectrum
 cargo build --release
+./target/release/spectrum
 ```
 
-Use `cargo build --release -j 2` if you want to bound build-time memory.
+You need Rust installed. Get it from rustup.rs if you dont have it.
 
-A truecolor terminal is recommended (Windows Terminal, WezTerm, kitty,
-iTerm2, Alacritty, modern gnome-terminal). The signature gradient stipple
-renders in every depth; on 256/16-color terminals run with `--colors 256`
-or `--colors 16` for the nearest-palette equivalent.
+## The lyrics garden needs an LRC file
 
-## Usage
+For the lyrics garden to work you need a `.lrc` file with the same name as your music file in the same folder. So if your song is `song.mp3` you need `song.lrc` next to it.
+
+The LRC file is just text with timestamps like this:
 
 ```
-# Visualize whatever Windows is playing (default system-output loopback)
-spectrum --capture
-
-# Play and visualize a file (mp3, wav, ogg vorbis, flac)
-spectrum song.mp3
-
-# Silent synthetic demo: all visuals, no audio hardware touched
-spectrum --demo
-
-# With options
-spectrum song.mp3 --theme fire --bars 96 --sensitivity 1.4
-spectrum --capture --source mic          # explicit microphone
-spectrum --demo --mode 4 --exit-after 10  # scripted QA / screenshots
+[00:01.00]First line of the song
+[00:05.50]Second line here
+[00:10.25]Third line
 ```
 
-| Option | Default | Meaning |
-|---|---|---|
-| `FILE` | - | Audio file to play and visualize |
-| `-c, --capture` | - | Visualize live audio (see `--source`) |
-| `--demo` | off | Silent synthetic generator; no audio hardware |
-| `--source NAME` | system | `system` (Windows output loopback) or `mic` |
-| `--mode N` | 5 | Start in mode 1-6 (spectrum/oscilloscope/waterfall/radial/mirror/lyrics); the mirror is the default composition |
-| `--exit-after SECS` | - | Exit cleanly after N seconds (scripted QA) |
-| `--freeze-at SECS` | - | With `--demo`: pin the synthetic timeline for deterministic, pixel-identical frames |
-| `--demo-lyric TEXT` | - | With `--demo`: show this one line in the lyrics garden instead of the fixture |
-| `-t, --theme NAME` | spectrum | spectrum, fire, ice, matrix, vapor |
-| `--bars N` | 64 | Frequency bands (8..=256) |
-| `--sensitivity F` | 1.0 | FFT display gain (0.1..=4.0, must be finite) |
-| `--smoothing F` | 0.12 | Bar fall speed (0.01 slow .. 0.95 instant) |
-| `--colors MODE` | true | true (24-bit), 256 or 16 (all stipple-dithered) |
+No LRC file means no lyrics. The app wont guess or make anything up, itll just tell you the sidecar is missing. If the LRC file has no timestamps you get plain unsynced text instead of the garden.
 
-Capture honesty: `--source system` opens the default *output* device via
-WASAPI loopback and never silently falls back to the microphone - if it
-cannot open, the error says what to try (`--source mic`). While running,
-the default output device is re-checked every second; switching speakers /
-headphones transparently rebuilds the stream (the status bar shows the live
-device and any reconnect state).
+## All the visual modes
+
+Press keys 1 through 5 to switch between them anytime
+
+- **1 Spectrum** - frequency bars with anti aliased tops and peak caps that fall down
+- **2 Oscilloscope** - a waveform trace that holds its shape using phase triggering
+- **3 Radial** - spectrum petals arranged in a circle around a breathing ring
+- **4 Mirror** (default) - bass in the middle mirrored outward like a butterfly
+- **5 Lyrics garden** - the current lyric line rendered as serif letters with flowers and stems growing out of them. Driven by the LRC sidecar timestamps.
 
 ## Controls
 
-| Key | Action |
-|---|---|
-| `1`-`6` | spectrum / oscilloscope / waterfall / radial / mirror / lyrics garden |
-| `Tab` / `Shift+Tab` | cycle visualizations |
-| `Space` | pause / resume audio |
-| `Up` / `Down` | volume (file mode) |
-| `+` / `-` | sensitivity |
-| `[` / `]` | bar smoothing (fall speed) |
-| `t` | cycle color theme |
-| `h` / `?` | help overlay |
-| `q` / `Esc` | quit |
+- `1` to `5` - switch visual mode
+- `space` - pause or resume
+- `m` - mute or unmute
+- `+` and `-` - volume up and down
+- `q` or `esc` - quit
+- `arrow keys` - seek forward or back
 
-## Lyrics
+## Beat detection
 
-Mode `6` reads the current track from the Windows System Media Transport
-Controls session (any player that exposes metadata to the OS: title,
-artist, timeline, playing state) and fetches timestamped lyrics from
-LRCLIB, an anonymous, keyless community API. Matching is conservative:
-artist and title must match exactly (version markers like "remix" or
-"feat." are part of the identity and are never stripped), the duration
-must agree within 2 seconds when known, and ambiguous results are rejected
-rather than showing another track. Plain (unsynced) text is shown as
-plain text, never claimed as synced; instrumental, no-match, offline and
-no-session states are labeled honestly. On non-Windows platforms there
-is no OS media API, so the mode shows its unavailable state.
+The header has a glowing dot that pulses when the music hits. Its driven by spectral flux which is just a fancy way of saying it watches for sudden changes in the frequency spectrum.
 
-Lyrics are community-sourced; their rights remain with their owners and
-no accuracy or completeness is promised (see NOTICE). `--demo --mode 6`
-renders the same garden from an original fixture track with no network.
+## Audio sources
 
-The garden is a direct port of the rendering algorithms of
-ridit-jangra/ascii-garden (MIT, (c) 2026 Ridit; notice preserved in
-NOTICE; port map in docs/PORT-PLAN.md), itself a reinterpretation of
-Akshat Agarwal's Type Garden, whose cell-grid ASCII approach comes from
-ascii-animals. Every garden cell is classified from a subpixel coverage mask into
-upstream's glyph families. The type is genuine Playfair Display
-(embedded unmodified, SIL OFL 1.1 - see NOTICE) at weight 700, as in
-the reference. Terminal cells cannot shrink the way upstream's do
-(about 17 cells per em), so the layout wraps a lyric line to the
-largest type that fits, and type smaller than about 12 rows per em is
-drawn as continuous quadrant-block silhouettes instead of one glyph per
-cell (which cannot form strokes at that size). Use
-`--demo --mode 6 --demo-lyric hello` to compare a short word with the
-reference.
+- **Local file** - pick any mp3 wav ogg or flac
+- **Live capture** - what Windows is playing right now (system loopback) or your microphone
 
-## Platform notes
+## What the lyrics garden looks like
 
-- **Windows**: `--capture` opens the default *output* device as a WASAPI
-  loopback input, visualizing whatever the system is playing. There is no
-  microphone fallback - if loopback cannot open, the error tells you what
-  to try (`--source mic` for explicit microphone capture).
-- **Linux**: capture uses the default input device - select a PulseAudio
-  or PipeWire *monitor* source to visualize system playback.
-- **macOS**: only microphone capture is supported (CoreAudio exposes no
-  system loopback).
-- Playback uses rodio; decoding supports mp3, wav, ogg vorbis and flac.
+When a synced LRC file is present the current line appears as large readable serif letters with flowers and curling stems growing out of them. The letters reveal line by line as the song plays. Its inspired by ascii garden and built with a real font rasterizer so the letterforms are actual Playfair Display shapes not just blocky ASCII art.
 
-## Development
+The garden needs a big terminal to look its best. At very small terminal sizes it falls back to plain text so you can still read the words.
+
+## Expert flags
+
+Any command line flag bypasses the menu entirely
 
 ```
-cargo test                    # unit + regression tests
-cargo clippy                  # lint (kept warning-free)
-cargo run --example preview   # headless glyph-level check of all renderers
-cargo run --release -- --demo # silent visual check without audio
-cargo run -- song.mp3          # run from source
+spectrum [options] [audio file]
+
+--theme NAME        color theme (spectrum fire ice matrix vapor)
+--mode N            start in mode 1-5
+--colors DEPTH      true 256 or 16 color depth
+--bars N            spectrum bands 8-256
+--sensitivity F     input gain
+--smoothing F       bar release speed
+--volume F          playback volume 0.0 to 1.0
+--source TYPE       system or mic for live capture
+--demo              silent synthetic demo mode
+--demo-lyric TEXT   show this text in the lyrics garden demo
+--freeze-at SECS    freeze the demo timeline at this point
+--exit-after SECS   auto quit after this many seconds
 ```
 
-Screenshots in `docs/screenshots/` were captured from the real running
-application (`--demo`, one window per mode/theme/depth) via
-`scripts/capture_all.ps1`.
+## Building from source
 
-Architecture: `audio` (playback tap + capture) feeds a lock-batched sample
-queue to `analysis` (Hann-windowed FFT, log bands, spectral-flux beat
-detection, waveform trigger) on its own thread; `ui` renders with ratatui
-using allocation-free hot paths and shared-frame `Arc` handoff.
+```bash
+cargo build --release
+```
+
+For development with tests:
+
+```bash
+cargo test
+```
+
+The lyrics garden uses an embedded Playfair Display font (SIL OFL 1.1 license) rasterized with ab_glyph. The own terminal feature uses a portable Windows Terminal runtime (MIT license) with Cascadia Mono font (SIL OFL 1.1). All licenses are in the `terminal/` folder.
 
 ## License
 
-MIT
+MIT. See LICENSE file.

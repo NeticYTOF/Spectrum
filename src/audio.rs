@@ -97,7 +97,10 @@ struct CaptureShared {
 /// Running audio source plus the handles needed to control it.
 pub struct AudioHandle {
     pub meta: Arc<Mutex<AudioMeta>>,
-    pub sink: Option<Sink>,
+    /// The playback sink for file mode, shared so the file-transcript
+    /// media thread can read the live position/pause state (rodio 0.19's
+    /// Sink is not Clone; Arc<Sink> is).
+    pub sink: Option<Arc<Sink>>,
     capture: Option<Arc<Mutex<CaptureShared>>>,
     /// Live capture sample rate; updated by the owner when the device
     /// changes so the analyzer can remap its FFT frequency geometry.
@@ -146,8 +149,16 @@ impl AudioHandle {
         }
     }
 
+    /// The live file playback position (seconds), refreshed by rodio's
+    /// internal ~5 ms ticker - MUCH fresher than the 10 Hz media
+    /// snapshot. Some only for file playback; capture/demo have no
+    /// sink and keep their own clocks.
+    pub fn playback_pos_secs(&self) -> Option<f64> {
+        self.sink.as_ref().map(|s| s.get_pos().as_secs_f64())
+    }
+
     /// Honest pause state (capture tracks it explicitly since cpal offers
-    /// no query).
+    /// no query; file playback asks the sink, demo uses its flag).
     pub fn is_paused(&self) -> bool {
         if self.demo {
             return self
@@ -155,6 +166,9 @@ impl AudioHandle {
                 .as_ref()
                 .map(|p| p.load(std::sync::atomic::Ordering::Relaxed))
                 .unwrap_or(false);
+        }
+        if let Some(sink) = &self.sink {
+            return sink.is_paused();
         }
         if let Some(cap) = &self.capture {
             return cap.lock().unwrap_or_else(|e| e.into_inner()).paused;
@@ -342,7 +356,7 @@ pub const DEFAULT_VOLUME: f32 = 0.8;
 /// count. Playback therefore runs at the correct pitch for any file rate,
 /// and this tap sits *before* that conversion, so the analyzer correctly
 /// maps FFT bins using the file's own sample rate.
-pub fn start_file(path: &Path, queue: SampleQueue) -> Result<AudioHandle> {
+pub fn start_file(path: &Path, queue: SampleQueue, volume: Option<f32>) -> Result<AudioHandle> {
     let file = File::open(path).with_context(|| format!("failed to open '{}'", path.display()))?;
     let decoder = Decoder::new(BufReader::new(file))
         .map_err(|e| anyhow!("failed to decode '{}' ({e})", path.display()))
@@ -365,7 +379,7 @@ pub fn start_file(path: &Path, queue: SampleQueue) -> Result<AudioHandle> {
     let (stream, stream_handle) =
         OutputStream::try_default().context("no audio output device is available")?;
     let sink = Sink::try_new(&stream_handle).context("failed to open the audio output stream")?;
-    sink.set_volume(DEFAULT_VOLUME);
+    sink.set_volume(volume.unwrap_or(DEFAULT_VOLUME).clamp(0.0, 1.0));
     sink.append(tee);
 
     Ok(AudioHandle {
@@ -374,7 +388,7 @@ pub fn start_file(path: &Path, queue: SampleQueue) -> Result<AudioHandle> {
             description,
             status: "playing",
         })),
-        sink: Some(sink),
+        sink: Some(Arc::new(sink)),
         capture: None,
         rate_watch: Arc::new(std::sync::atomic::AtomicU32::new(sample_rate)),
         _output: Some(stream),

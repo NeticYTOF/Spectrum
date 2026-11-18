@@ -10,6 +10,8 @@ pub mod garden;
 pub mod lrc;
 pub mod lyrics;
 pub mod media;
+#[cfg(windows)]
+pub mod own_term;
 pub mod theme;
 pub mod ui;
 pub mod visualizers;

@@ -12,7 +12,7 @@ fn main() {
             Some((a.parse().ok()?, b.parse().ok()?))
         })
         .unwrap_or((72u16, 20u16));
-    for mode in 1..=6u8 {
+    for mode in 1..=5u8 {
         let buf = spectrum::ui::snapshot(&spectrum::ui::Snapshot {
             mode,
             theme: "spectrum",

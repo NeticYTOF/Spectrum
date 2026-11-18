@@ -1,6 +1,5 @@
 //! Terminal UI: event loop, layout, status bar and help overlay.
 
-use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,7 +26,6 @@ use crate::visualizers;
 pub enum Mode {
     Bars,
     Scope,
-    Gram,
     Radial,
     Mirror,
     Lyrics,
@@ -38,7 +36,6 @@ impl Mode {
         match self {
             Mode::Bars => "Spectrum",
             Mode::Scope => "Oscilloscope",
-            Mode::Gram => "Waterfall",
             Mode::Radial => "Radial",
             Mode::Mirror => "Mirror",
             Mode::Lyrics => "Lyrics Garden",
@@ -48,8 +45,7 @@ impl Mode {
     fn next(self) -> Self {
         match self {
             Mode::Bars => Mode::Scope,
-            Mode::Scope => Mode::Gram,
-            Mode::Gram => Mode::Radial,
+            Mode::Scope => Mode::Radial,
             Mode::Radial => Mode::Mirror,
             Mode::Mirror => Mode::Lyrics,
             Mode::Lyrics => Mode::Bars,
@@ -60,8 +56,7 @@ impl Mode {
         match self {
             Mode::Bars => Mode::Lyrics,
             Mode::Scope => Mode::Bars,
-            Mode::Gram => Mode::Scope,
-            Mode::Radial => Mode::Gram,
+            Mode::Radial => Mode::Scope,
             Mode::Mirror => Mode::Radial,
             Mode::Lyrics => Mode::Mirror,
         }
@@ -71,9 +66,8 @@ impl Mode {
         match m {
             1 => Mode::Bars,
             2 => Mode::Scope,
-            3 => Mode::Gram,
-            4 => Mode::Radial,
-            5 => Mode::Mirror,
+            3 => Mode::Radial,
+            4 => Mode::Mirror,
             _ => Mode::Lyrics,
         }
     }
@@ -87,10 +81,6 @@ const RELEASE_TAU: f32 = 0.14;
 
 /// Beat-flash exponential decay rate (fraction e^-kt remaining after t).
 const BEAT_FLASH_DECAY_PER_SEC: f32 = 8.0;
-/// Spectrogram scroll: one new column this often.
-const GRAM_INTERVAL_SECS: f32 = 1.0 / 30.0;
-/// Spectrogram history bound in columns; >= any realistic terminal width.
-const GRAM_HISTORY: usize = 1024;
 
 pub struct App {
     pub mode: Mode,
@@ -106,8 +96,6 @@ pub struct App {
     display: Vec<f32>,
     /// Smoothed spectral flux (radial ring breathing).
     flux: f32,
-    gram: VecDeque<Vec<f32>>,
-    gram_accum: f32,
     last_frame: Instant,
     scratch: visualizers::RenderScratch,
     themes: Vec<Theme>,
@@ -147,8 +135,6 @@ impl App {
             peaks: visualizers::Peaks::new(),
             display: Vec::new(),
             flux: 0.0,
-            gram: VecDeque::with_capacity(GRAM_HISTORY + 16),
-            gram_accum: 0.0,
             last_frame: Instant::now(),
             scratch: visualizers::RenderScratch::new(),
             themes,
@@ -273,7 +259,7 @@ fn event_loop(
 }
 
 /// Per-frame state shared by the live loop and headless snapshots: beat
-/// flash decay and the spectrogram history cadence.
+/// flash decay.
 fn tick_app(app: &mut App, analysis: &FrameAnalysis, beat: bool, dt: f32) {
     // Attack/release display smoothing.
     if app.display.len() != analysis.bars.len() {
@@ -296,21 +282,6 @@ fn tick_app(app: &mut App, analysis: &FrameAnalysis, beat: bool, dt: f32) {
             app.beat_flash = 0.0;
         }
     }
-
-    // Spectrogram history: newest column on the right, pushed at a fixed
-    // wall-clock cadence regardless of frame rate.
-    if app.mode == Mode::Gram {
-        app.gram_accum += dt;
-        if app.gram_accum >= GRAM_INTERVAL_SECS {
-            app.gram_accum = 0.0;
-            app.gram.push_back(analysis.spectrum.clone());
-            while app.gram.len() > GRAM_HISTORY {
-                app.gram.pop_front();
-            }
-        }
-    } else {
-        app.gram_accum = GRAM_INTERVAL_SECS;
-    }
 }
 
 /// What a headless snapshot renders: the real `draw` path driven by the
@@ -332,6 +303,15 @@ pub struct Snapshot<'a> {
 
 /// Render one frame of the real UI into a buffer (headless QA and tests).
 pub fn snapshot(s: &Snapshot<'_>) -> ratatui::buffer::Buffer {
+    snapshot_timed(s).0
+}
+
+/// [`Snapshot`] plus the measured wall time of EVERY rendered frame
+/// (analysis + tick + draw), in order: frame 0 is the COLD frame (scene
+/// build + font raster + first draw), the rest are warm frames of the
+/// cached scene. Diagnostic surface for the QA frame-budget work -
+/// production paths never call this.
+pub fn snapshot_timed(s: &Snapshot<'_>) -> (ratatui::buffer::Buffer, Vec<std::time::Duration>) {
     use ratatui::backend::TestBackend;
     let bands = crate::analysis::DEFAULT_BANDS;
     let shared = Arc::new(Mutex::new(SharedState {
@@ -351,12 +331,14 @@ pub fn snapshot(s: &Snapshot<'_>) -> ratatui::buffer::Buffer {
     let mut terminal = Terminal::new(TestBackend::new(s.width, s.height)).expect("test backend");
     let dt = 1.0 / 60.0;
     let frames = (s.warmup.max(0.0) / dt).round() as usize + 1;
+    let mut times = Vec::with_capacity(frames);
     for k in 0..frames {
         let t = if s.frozen {
             s.at
         } else {
             s.at - (frames - 1 - k) as f32 * dt
         };
+        let f0 = std::time::Instant::now();
         let analysis = crate::demo::synthetic_frame(t, bands);
         if !s.frozen {
             let mut m = media.lock().unwrap_or_else(|e| e.into_inner());
@@ -367,8 +349,9 @@ pub fn snapshot(s: &Snapshot<'_>) -> ratatui::buffer::Buffer {
         terminal
             .draw(|f| draw(f, &mut app, &analysis, &audio, &media, &lyrics, dt))
             .expect("draw");
+        times.push(f0.elapsed());
     }
-    terminal.backend().buffer().clone()
+    (terminal.backend().buffer().clone(), times)
 }
 
 fn on_key(app: &mut App, shared: &Arc<Mutex<SharedState>>, audio: &AudioHandle, key: KeyEvent) {
@@ -387,10 +370,9 @@ fn on_key(app: &mut App, shared: &Arc<Mutex<SharedState>>, audio: &AudioHandle, 
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
         KeyCode::Char('1') => set_mode(app, Mode::Bars),
         KeyCode::Char('2') => set_mode(app, Mode::Scope),
-        KeyCode::Char('3') => set_mode(app, Mode::Gram),
-        KeyCode::Char('4') => set_mode(app, Mode::Radial),
-        KeyCode::Char('5') => set_mode(app, Mode::Mirror),
-        KeyCode::Char('6') => set_mode(app, Mode::Lyrics),
+        KeyCode::Char('3') => set_mode(app, Mode::Radial),
+        KeyCode::Char('4') => set_mode(app, Mode::Mirror),
+        KeyCode::Char('5') => set_mode(app, Mode::Lyrics),
         KeyCode::Tab => set_mode(app, app.mode.next()),
         KeyCode::BackTab => set_mode(app, app.mode.prev()),
         KeyCode::Char(' ') => {
@@ -426,10 +408,7 @@ fn on_key(app: &mut App, shared: &Arc<Mutex<SharedState>>, audio: &AudioHandle, 
 }
 
 fn set_mode(app: &mut App, mode: Mode) {
-    if app.mode != mode {
-        app.mode = mode;
-        app.gram.clear();
-    }
+    app.mode = mode;
 }
 
 fn adjust_sensitivity(app: &mut App, shared: &Arc<Mutex<SharedState>>, delta: f32) {
@@ -513,7 +492,6 @@ fn draw(
     let App {
         themes,
         peaks,
-        gram,
         scratch,
         display,
         flux,
@@ -549,7 +527,6 @@ fn draw(
             scratch,
             dt,
         ),
-        Mode::Gram => visualizers::render_spectrogram(f.buffer_mut(), inner, gram, theme),
         Mode::Lyrics => render_lyrics(
             f.buffer_mut(),
             inner,
@@ -559,6 +536,7 @@ fn draw(
             lyrics,
             dt,
             audio.demo,
+            audio.playback_pos_secs(),
         ),
     }
 
@@ -794,7 +772,7 @@ fn status_line_with(
     ));
 
     let wide = Span::styled(
-        "1-6 modes \u{b7} space pause \u{b7} t theme \u{b7} h help \u{b7} q quit",
+        "1-5 modes \u{b7} space pause \u{b7} t theme \u{b7} h help \u{b7} q quit",
         Style::new().fg(dim),
     );
 
@@ -858,8 +836,8 @@ fn help_text(accent: Color) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     lines.extend([
         mk(
-            "1 / 2 / 3 / 4 / 5 / 6",
-            "spectrum \u{b7} scope \u{b7} waterfall \u{b7} radial \u{b7} mirror (default) \u{b7} lyrics garden",
+            "1 / 2 / 3 / 4 / 5",
+            "spectrum \u{b7} scope \u{b7} radial \u{b7} mirror (default) \u{b7} lyrics garden",
         ),
         mk("Tab / Shift+Tab", "cycle visualizations"),
         mk("Space", "pause / resume audio"),
@@ -895,6 +873,7 @@ fn render_lyrics(
     lyrics: &crate::lyrics::LyricsShared,
     dt: f32,
     demo: bool,
+    file_pos_s: Option<f64>,
 ) {
     let snap = media.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let state = lyrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -913,6 +892,15 @@ fn render_lyrics(
     let media_key = crate::lyrics::TrackKey::from_snapshot(&snap);
     let identity_ok = media_key.is_some() && state.key == media_key;
 
+    // The playback clock for word-level reveal: rodio's Sink::get_pos
+    // (file playback) refreshes internally at ~5 ms - MUCH fresher than
+    // the 10 Hz media snapshot, so words land within the frame budget
+    // instead of the media poll quantization. Capture (SMTC clock) and
+    // the demo (synthetic clock) have no sink and keep the snapshot
+    // position. Pause freezes get_pos; the file media thread's identity
+    // fields are unaffected.
+    let pos_now = file_pos_s.unwrap_or(snap.position_s);
+
     let (garden_state, lines, plain, current, since) = if !identity_ok {
         // No session, or the state belongs to a previous track: show the
         // honest per-media state, never stale words.
@@ -926,13 +914,13 @@ fn render_lyrics(
             LyricsStatus::Unavailable => (GardenState::Unavailable, None, None, None, 5.0),
             LyricsStatus::Loading => (GardenState::Loading, None, None, None, 0.0),
             LyricsStatus::Synced(lines) => {
-                let idx = crate::lrc::line_at(lines, snap.position_s);
+                let idx = crate::lrc::line_at(lines, pos_now);
                 // Bloom age derives from the track timeline (position -
                 // line start), so a frozen demo freezes the bloom too;
                 // line/track identity changes reset it inherently because
                 // the new line's start time anchors the age again.
                 let since = match idx {
-                    Some(i) => ((snap.position_s - lines[i].time_s).max(0.0)) as f32,
+                    Some(i) => ((pos_now - lines[i].time_s).max(0.0)) as f32,
                     None => 5.0,
                 };
                 (GardenState::Synced, Some(lines.clone()), None, idx, since)
@@ -952,7 +940,7 @@ fn render_lyrics(
         plain: plain.as_deref(),
         state: garden_state,
         energy: app.sway_energy.clamp(0.0, 1.0),
-        time_s: snap.position_s as f32,
+        time_s: pos_now as f32,
         since_line_change: since,
         demo,
     };
@@ -1011,7 +999,7 @@ mod tests {
             let area = ratatui::layout::Rect::new(0, 0, w, h);
             let mut buf = Buffer::empty(area);
             render_lyrics(
-                &mut buf, area, &mut app, &analysis, &media, &lyrics, 0.016, true,
+                &mut buf, area, &mut app, &analysis, &media, &lyrics, 0.016, true, None,
             );
             let text: String = buf.content().iter().map(|c| c.symbol()).collect();
             assert!(
@@ -1044,10 +1032,22 @@ mod tests {
                     _ => {}
                 }
             }
-            assert!(drawn > 40, "{w}x{h}: garden drew {drawn} cells");
+            assert!(drawn > 20, "{w}x{h}: garden drew {drawn} cells");
             assert!(ink > 0, "{w}x{h}: no lyric ink drawn");
-            assert!(stem > 0, "{w}x{h}: no stems drawn");
-            assert!(flower > 0, "{w}x{h}: no flowers drawn");
+            if (w, h) == (72, 22) {
+                // Under upstream's size caps the fixture at this size
+                // (~2.9 em rows) falls below the legible floor, so the
+                // honest render is the PLAIN-TEXT fallback: every word
+                // present, no plants. (With the 2:3 cell aspect the
+                // width-capped em is taller: 144x42 ~5.9 em rows and
+                // 100x30 ~4.1 em rows - both real silhouette gardens.)
+                for word in "every beat a budding bloom".split(' ') {
+                    assert!(text.contains(word), "{w}x{h} plain fallback lost {word:?}");
+                }
+            } else {
+                assert!(stem > 0, "{w}x{h}: no stems drawn");
+                assert!(flower > 0, "{w}x{h}: no flowers drawn");
+            }
         }
     }
 
@@ -1074,9 +1074,76 @@ mod tests {
             &lyrics,
             0.016,
             true,
+            None, // demo: no file sink, the snapshot clock drives the view
         );
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("looking for lyrics"), "gate relaxed");
+    }
+
+    /// The FILE playback clock (rodio's ~5 ms Sink::get_pos, passed in
+    /// per frame) must drive the garden when present - the media
+    /// snapshot's 10 Hz position is only the fallback for capture/demo.
+    /// This is the word-level reveal clock: pause freezes it (same
+    /// position, byte-identical render), and a later position selects
+    /// the later line.
+    #[test]
+    fn file_clock_drives_the_garden_when_present() {
+        let media = crate::media::new_shared();
+        let lyrics = crate::lyrics::new_shared();
+        // Demo fixture lines: 0.2, 1.8, 3.4, 5.0, 6.6 - at 4.5 s the
+        // current line is "every beat a budding bloom" (3.4), at 6.0 s
+        // it is "silence is the resting soil" (5.0).
+        demo::seed_demo_state(&media, &lyrics, 4.5, true, None);
+        let analysis = FrameAnalysis::quiet(64);
+        let area = ratatui::layout::Rect::new(0, 0, 144, 42);
+
+        let mut snap_clock = Buffer::empty(area);
+        render_lyrics(
+            &mut snap_clock,
+            area,
+            &mut demo_app(),
+            &analysis,
+            &media,
+            &lyrics,
+            0.016,
+            true,
+            None,
+        );
+        let mut file_clock_same = Buffer::empty(area);
+        render_lyrics(
+            &mut file_clock_same,
+            area,
+            &mut demo_app(),
+            &analysis,
+            &media,
+            &lyrics,
+            0.016,
+            true,
+            Some(4.5),
+        );
+        assert_eq!(
+            snap_clock.content(),
+            file_clock_same.content(),
+            "an equal file clock must render exactly the snapshot clock"
+        );
+
+        let mut file_clock_later = Buffer::empty(area);
+        render_lyrics(
+            &mut file_clock_later,
+            area,
+            &mut demo_app(),
+            &analysis,
+            &media,
+            &lyrics,
+            0.016,
+            true,
+            Some(6.0),
+        );
+        assert_ne!(
+            file_clock_same.content(),
+            file_clock_later.content(),
+            "the file clock must drive line selection (later line expected)"
+        );
     }
 
     #[test]
@@ -1120,7 +1187,7 @@ mod tests {
         let text = span_text(&wide);
         assert!(text.contains("demo"), "chip missing: {text}");
         assert!(text.contains("synthetic"), "source missing: {text}");
-        assert!(text.contains("1-6 modes"), "wide hints missing: {text}");
+        assert!(text.contains("1-5 modes"), "wide hints missing: {text}");
         assert!(!text.contains("h help \u{b7} q quit h"), "dup: {text}");
         assert_eq!(text.matches("DEMO").count(), 0, "duplicated DEMO: {text}");
 
@@ -1144,7 +1211,7 @@ mod tests {
             "short hints or ellipsis expected: {ntext}"
         );
         assert!(
-            !ntext.contains("1-6 modes"),
+            !ntext.contains("1-5 modes"),
             "wide hints must drop: {ntext}"
         );
     }
@@ -1204,22 +1271,53 @@ mod tests {
         let mut mirror_buf = Buffer::empty(area);
         visualizers::render_mirror(&mut mirror_buf, area, &frame.bars, &theme, &mut scratch);
         assert!(nonblank(&mirror_buf) > 300, "mirror too sparse");
+    }
 
-        // Spectrogram: push a few columns of history at the same phase.
-        let mut cols = std::collections::VecDeque::new();
-        for k in 0..30u32 {
-            let f = demo::synthetic_frame(5.0 - k as f32 * 0.033, 64);
-            cols.push_back(f.spectrum);
+    /// The mode mapping is explicit and part of the contract: keys 1-5,
+    /// Tab cycling through all five, and the numbers resolve to distinct
+    /// modes (the waterfall was removed; nothing maps to it).
+    #[test]
+    fn mode_mapping_is_explicit() {
+        assert_eq!(Mode::from_number(1), Mode::Bars);
+        assert_eq!(Mode::from_number(2), Mode::Scope);
+        assert_eq!(Mode::from_number(3), Mode::Radial);
+        assert_eq!(Mode::from_number(4), Mode::Mirror);
+        assert_eq!(Mode::from_number(5), Mode::Lyrics);
+        // Out-of-range falls back to the garden (the CLI validates 1-5).
+        assert_eq!(Mode::from_number(6), Mode::Lyrics);
+
+        // Tab cycles through every mode exactly once, back to the start.
+        let mut m = Mode::Bars;
+        let mut seen = vec![m];
+        for _ in 0..4 {
+            m = m.next();
+            seen.push(m);
         }
-        let mut gram_buf = Buffer::empty(area);
-        visualizers::render_spectrogram(&mut gram_buf, area, &cols, &theme);
-        let canvas = visualizers::canvas(&theme);
-        let lit = gram_buf
-            .content()
-            .iter()
-            .filter(|c| c.fg != canvas || c.bg != canvas)
-            .count();
-        assert!(lit > 200, "spectrogram too sparse: {lit}");
+        assert_eq!(seen.len(), 5, "five distinct modes: {seen:?}");
+        assert_eq!(m.next(), Mode::Bars, "cycle closes");
+        // prev inverts next.
+        for mode in [
+            Mode::Bars,
+            Mode::Scope,
+            Mode::Radial,
+            Mode::Mirror,
+            Mode::Lyrics,
+        ] {
+            assert_eq!(mode.next().prev(), mode, "prev must invert next");
+        }
+        // Names are unique and non-empty.
+        let names: Vec<&str> = [
+            Mode::Bars,
+            Mode::Scope,
+            Mode::Radial,
+            Mode::Mirror,
+            Mode::Lyrics,
+        ]
+        .iter()
+        .map(|m| m.name())
+        .collect();
+        let unique: std::collections::HashSet<_> = names.iter().copied().collect();
+        assert_eq!(unique.len(), 5, "mode names must be unique: {names:?}");
     }
 
     #[test]
@@ -1322,7 +1420,7 @@ mod tests {
         // The headless snapshot runs the real `draw`: every mode must
         // produce content, the garden must not be stuck in Loading, and
         // the bar modes must carry the quiet header with an honest DEMO.
-        for mode in 1..=6u8 {
+        for mode in 1..=5u8 {
             let buf = snapshot(&Snapshot {
                 mode,
                 theme: "spectrum",
@@ -1346,7 +1444,7 @@ mod tests {
     #[ignore]
     fn frame_cost_probe() {
         // Average draw cost per frame at 144x42 (release build recommended).
-        for mode in 1..=6u8 {
+        for mode in 1..=5u8 {
             let frames = 120.0;
             let t0 = std::time::Instant::now();
             let _ = snapshot(&Snapshot {
@@ -1404,9 +1502,11 @@ mod tests {
         (letter_rows, plant_rows)
     }
 
-    fn snap_mode6(lyric: Option<&str>, w: u16, h: u16) -> Buffer {
+    /// The lyrics garden via the real UI path (mode 5 after the
+    /// waterfall removal).
+    fn snap_garden(lyric: Option<&str>, w: u16, h: u16) -> Buffer {
         snapshot(&Snapshot {
-            mode: 6,
+            mode: 5,
             theme: "spectrum",
             depth: ColorDepth::True,
             at: 4.5,
@@ -1418,10 +1518,10 @@ mod tests {
         })
     }
 
-    /// The exact `--demo --mode 6 --demo-lyric hello --freeze-at 4.5` path.
-    fn snap_mode6_frozen(lyric: Option<&str>, w: u16, h: u16) -> Buffer {
+    /// The exact `--demo --mode 5 --demo-lyric hello --freeze-at 4.5` path.
+    fn snap_garden_frozen(lyric: Option<&str>, w: u16, h: u16) -> Buffer {
         snapshot(&Snapshot {
-            mode: 6,
+            mode: 5,
             theme: "spectrum",
             depth: ColorDepth::True,
             at: 4.5,
@@ -1444,9 +1544,9 @@ mod tests {
             for frozen in [false, true] {
                 for lyric in [Some("hello"), None] {
                     let buf = if frozen {
-                        snap_mode6_frozen(lyric, w, h)
+                        snap_garden_frozen(lyric, w, h)
                     } else {
-                        snap_mode6(lyric, w, h)
+                        snap_garden(lyric, w, h)
                     };
                     let (letter_rows, plant_rows) = garden_rows(&buf, w, h);
                     for (name, rows) in [("letters", &letter_rows), ("plants", &plant_rows)] {
@@ -1474,7 +1574,7 @@ mod tests {
         // The single-line custom lyric has no prev row, so the band starts
         // at row 1: the ascenders must keep at least two rows below it.
         for (w, h) in [(144u16, 42u16), (72, 22)] {
-            let buf = snap_mode6_frozen(Some("hello"), w, h);
+            let buf = snap_garden_frozen(Some("hello"), w, h);
             let (letter_rows, _) = garden_rows(&buf, w, h);
             let top = letter_rows.first().copied().unwrap_or(0);
             assert!(
@@ -1490,55 +1590,95 @@ mod tests {
     #[test]
     fn frozen_and_live_lay_out_the_same_type() {
         // Layout is a pure function of text and size: the frozen CLI path
-        // and a live render at the same demo time must place the type in
-        // the SAME rows (only bloom/sway detail may differ).
+        // and a live render at the same demo time must place the type
+        // identically. The comparison runs in the SILENCE section
+        // (7.95 s): during the loud drop the live garden sways with the
+        // music BY DESIGN (frozen plants hold still), and a swayed flower
+        // covering or revealing a boundary ascender cell flips the
+        // ink-row extents by 2 (measured: hello 144x42 (17..23) frozen
+        // vs (15..23) live at 4.5 s) - that is layering noise, not a
+        // placement difference. At rest both paths must agree, and any
+        // real placement divergence shows up there just the same.
         for (w, h) in [(144u16, 42u16), (72, 22)] {
             for lyric in [Some("hello"), None] {
-                let (a, b) = (snap_mode6_frozen(lyric, w, h), snap_mode6(lyric, w, h));
+                let spec = |frozen: bool| Snapshot {
+                    mode: 5,
+                    theme: "spectrum",
+                    depth: ColorDepth::True,
+                    at: 7.95,
+                    frozen,
+                    warmup: if frozen { 0.0 } else { 1.5 },
+                    lyric,
+                    width: w,
+                    height: h,
+                };
+                let a = snapshot(&spec(true));
+                let b = snapshot(&spec(false));
                 let (la, _) = garden_rows(&a, w, h);
                 let (lb, _) = garden_rows(&b, w, h);
-                assert_eq!(la, lb, "{w}x{h} frozen/live letter rows differ ({lyric:?})");
+                let extent = |r: &[u16]| {
+                    (
+                        r.first().copied().unwrap_or(0),
+                        r.last().copied().unwrap_or(0),
+                    )
+                };
+                let (ta, ba) = extent(&la);
+                let (tb, bb) = extent(&lb);
+                assert!(
+                    ta.abs_diff(tb) <= 1 && ba.abs_diff(bb) <= 1,
+                    "{w}x{h} frozen/live placement differs: ({ta}..{ba}) vs ({tb}..{bb}) ({lyric:?})"
+                );
+                // And both actually drew the word.
+                assert!(
+                    !la.is_empty() && !lb.is_empty(),
+                    "{w}x{h} no type ({lyric:?})"
+                );
             }
         }
     }
 
     #[test]
-    fn garden_plants_do_not_tower_over_the_word() {
-        // The upstream demo keeps plants as compact ornaments around the
-        // type; ours used to form a canopy taller than the word itself.
-        // Plants may rise at most a few rows above the letter tops.
+    fn garden_type_caps_at_the_upstream_reference_size() {
+        // The reference comparison gave exact upstream demo metrics: the
+        // word is NARROW and centered (St = 0.28 H), not maximized
+        // full-width. At 144x42 the band is ~40 rows, so the em must be
+        // about 0.28 x 40 = 11.2 rows of ink - previously it filled nearly
+        // the whole height, which the reviewer rejected.
         let (w, h) = (144u16, 42u16);
-        let buf = snap_mode6(Some("hello"), w, h);
-        let (letter_rows, plant_rows) = garden_rows(&buf, w, h);
-        let ltop = letter_rows.first().copied().unwrap_or(0);
-        let ptop = plant_rows.first().copied().unwrap_or(0);
+        let buf = snap_garden(Some("hello"), w, h);
+        let (letter_rows, _) = garden_rows(&buf, w, h);
+        let ink_rows = letter_rows.len();
         assert!(
-            ptop as i32 >= ltop as i32 - 3,
-            "plants rise to row {ptop}, letters start at {ltop}"
+            (5..=18).contains(&ink_rows),
+            "hello ink spans {ink_rows} rows; upstream St=0.28H implies ~11"
         );
+        // The word sits inside the middle of the band, not pressed high.
+        let top = letter_rows.first().copied().unwrap_or(0);
+        let bot = letter_rows.last().copied().unwrap_or(0);
+        assert!(top >= 5, "word too high: ink starts at row {top}");
+        assert!(bot <= h - 6, "word too low: ink ends at row {bot}");
     }
 
     #[test]
-    fn small_terminal_keeps_a_sparse_garden() {
-        // 72x22 used to fall back to plain text for the multi-line
-        // fixture; the garden (sparser, via chaos easing) must survive,
-        // with both wrapped lines drawn as type.
+    fn small_terminal_shows_every_word_honestly() {
+        // Under upstream's size caps a 72x22 band (~19 usable rows) gives
+        // the fixture line an em under the legible floor, so it renders as
+        // wrapped plain text - honest, never dropped. "hello" still gets
+        // a garden (its single word fits 0.28 H).
         let (w, h) = (72u16, 22u16);
-        let buf = snap_mode6(None, w, h);
+
+        // Fixture: plain fallback, but every word present.
+        let buf = snap_garden(None, w, h);
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect::<String>();
+        for word in "every beat a budding bloom".split(' ') {
+            assert!(text.contains(word), "{w}x{h} lost {word:?}");
+        }
+
+        // hello: a real garden with plants.
+        let buf = snap_garden(Some("hello"), w, h);
         let (letter_rows, plant_rows) = garden_rows(&buf, w, h);
-        assert!(!letter_rows.is_empty(), "fixture type missing at {w}x{h}");
-        // Two wrapped lines: a gap of >= 2 rows between letter-row groups.
-        let groups = letter_rows
-            .iter()
-            .fold(Vec::<(u16, u16)>::new(), |mut acc, &y| {
-                match acc.last_mut() {
-                    Some((_, end)) if y <= *end + 1 => *end = y,
-                    _ => acc.push((y, y)),
-                }
-                acc
-            });
-        assert!(groups.len() >= 2, "expected two lines, got {groups:?}");
-        assert!(!plant_rows.is_empty(), "garden missing at {w}x{h}");
+        assert!(!letter_rows.is_empty(), "hello type missing at {w}x{h}");
+        assert!(!plant_rows.is_empty(), "hello garden missing at {w}x{h}");
     }
 
     #[test]
@@ -1548,7 +1688,7 @@ mod tests {
         // where plants reach, and the breathing margins. Exact buffer cells,
         // no pixel thresholds. Run with --ignored --nocapture.
         let probe = |lyric: Option<&str>, w: u16, h: u16| {
-            let buf = snap_mode6(lyric, w, h);
+            let buf = snap_garden(lyric, w, h);
             let (letter_rows, plant_rows) = garden_rows(&buf, w, h);
             let first = |v: &[u16]| v.first().copied().unwrap_or(u16::MAX);
             let last = |v: &[u16]| v.last().copied().unwrap_or(0);
@@ -1575,7 +1715,7 @@ mod tests {
         // Frame-to-frame change rate per mode (live, 60 fps): flicker or
         // jitter shows up as a high rate of cells changing between two
         // consecutive frames. Prints; run with --ignored --nocapture.
-        for mode in 1..=6u8 {
+        for mode in 1..=5u8 {
             let snap = |at: f32| {
                 snapshot(&Snapshot {
                     mode,

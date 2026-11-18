@@ -113,6 +113,38 @@ pub fn spawn_media(shared: MediaShared, stop: Arc<AtomicBool>) -> JoinHandle<()>
         .expect("failed to spawn media thread")
 }
 
+/// A synthetic media source (NOT SMTC): used when visualizing a local
+/// file with its own local transcription as the lyrics. `snapshot_fn`
+/// produces the honest snapshot each tick; its identity fields
+/// (title/artist/album/duration) must stay constant so the lyrics
+/// identity gate keeps matching across ticks.
+///
+/// LATENCY BUDGET (word-level reveal, documented honestly): the tick
+/// is 50 ms (position staleness), the UI frame adds up to ~45 ms, and
+/// the DEVICE output buffer - the gap between rodio's consumed-sample
+/// position (what `Sink::get_pos` reports) and the actual speaker -
+/// is device-specific and NOT compensated. Words can therefore appear
+/// slightly EARLY by roughly the device buffer depth (~tens of ms on
+/// Windows shared mode); this is a stated budget term, not a hidden
+/// claim of perfect sync.
+pub fn spawn_synthetic_media(
+    shared: MediaShared,
+    stop: Arc<AtomicBool>,
+    mut snapshot_fn: impl FnMut() -> MediaSnapshot + Send + 'static,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("spectrum-file-media".into())
+        .spawn(move || loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let snap = snapshot_fn();
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = snap;
+            std::thread::sleep(Duration::from_millis(50));
+        })
+        .expect("failed to spawn file-media thread")
+}
+
 /// Read SMTC and build an immutable base, anchoring `read_at` with the
 /// timeline's `LastUpdatedTime` so extrapolation starts from when the
 /// position was actually accurate (the poll itself can lag the player).
@@ -389,5 +421,41 @@ mod tests {
         let b = base(0.0, t0, true, None);
         let pos = extrapolate(&b, t0);
         assert!(pos >= 0.0);
+    }
+
+    #[test]
+    fn synthetic_media_publishes_snapshots_and_stops() {
+        // The file-transcript media source: a snapshot_fn whose identity
+        // fields stay constant while the position advances. The thread
+        // must publish (bounded wait) and stop on the flag.
+        let shared = new_shared();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut pos = 0.0f64;
+        let h = spawn_synthetic_media(shared.clone(), stop.clone(), move || {
+            pos += 0.1;
+            MediaSnapshot {
+                available: true,
+                title: "local-file".into(),
+                artist: "(local file)".into(),
+                album: "local transcription".into(),
+                duration_s: Some(10.0),
+                position_s: pos,
+                playing: true,
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let s = shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if s.available && s.position_s > 0.0 && s.title == "local-file" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "synthetic media thread never published a snapshot"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::Relaxed);
+        h.join().expect("thread must join cleanly");
     }
 }

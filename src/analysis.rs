@@ -1,8 +1,8 @@
 //! FFT analysis: windowing, frequency bands, smoothing and beat detection.
 //!
 //! The [`Analyzer`] owns a rolling sample history and converts it into
-//! per-band magnitudes (bars), an unsmoothed spectrum (spectrogram), a
-//! zero-aligned waveform (oscilloscope) and a beat flag (spectral flux).
+//! per-band magnitudes (bars), a zero-aligned waveform (oscilloscope)
+//! and a beat flag (spectral flux).
 
 use std::collections::VecDeque;
 use std::f32::consts::PI;
@@ -22,7 +22,6 @@ pub const MIN_FREQ: f32 = 30.0;
 pub const MAX_FREQ: f32 = 16_000.0;
 
 const BARS_RISE: f32 = 0.55;
-const SPECTRUM_RISE: f32 = 0.6;
 const BEAT_MULTIPLIER: f32 = 1.45;
 const BEAT_MIN_FRAMES: usize = 20;
 const BEAT_REFRACTORY: Duration = Duration::from_millis(140);
@@ -62,8 +61,6 @@ impl Params {
 pub struct FrameAnalysis {
     /// Smoothed per-band magnitude in 0..=1, low -> high frequency.
     pub bars: Vec<f32>,
-    /// Unsmoothed per-band magnitude in 0..=1 (spectrogram input).
-    pub spectrum: Vec<f32>,
     /// Recent mono waveform, rising-zero aligned for a stable display.
     pub waveform: Vec<f32>,
     pub beat: bool,
@@ -74,7 +71,6 @@ impl FrameAnalysis {
     pub fn quiet(bands: usize) -> Self {
         Self {
             bars: vec![0.0; bands],
-            spectrum: vec![0.0; bands],
             waveform: Vec::new(),
             beat: false,
             flux: 0.0,
@@ -84,7 +80,7 @@ impl FrameAnalysis {
 
 pub struct SharedState {
     /// Published analysis frame; shared by pointer so the UI never
-    /// deep-copies bars/spectrum/waveform per frame.
+    /// deep-copies bars/waveform per frame.
     pub latest: Arc<FrameAnalysis>,
     pub params: Params,
     /// Beats detected since the UI last looked; lets the UI never miss one.
@@ -106,7 +102,6 @@ pub struct Analyzer {
     targets: Vec<f32>,
     flux_hist: VecDeque<f32>,
     bars: Vec<f32>,
-    spectrum: Vec<f32>,
     last_beat: Instant,
     /// Whether the previous tick saw fresh samples; used to reseed the
     /// spectral-flux baseline after a pause so resuming can't register
@@ -184,7 +179,6 @@ impl Analyzer {
             targets: vec![0.0; bands],
             flux_hist: VecDeque::with_capacity(FLUX_HISTORY),
             bars: vec![0.0; bands],
-            spectrum: vec![0.0; bands],
             last_beat: Instant::now(),
             was_active: false,
         }
@@ -238,13 +232,9 @@ impl Analyzer {
             for b in &mut self.bars {
                 *b *= decay;
             }
-            for s in &mut self.spectrum {
-                *s *= 0.9;
-            }
             self.was_active = active;
             return FrameAnalysis {
                 bars: self.bars.clone(),
-                spectrum: self.spectrum.clone(),
                 waveform: Vec::new(),
                 beat: false,
                 flux: 0.0,
@@ -280,7 +270,6 @@ impl Analyzer {
         }
         let bars_fall = smoothing_factor(rate_from_fraction(params.fall), dt);
         let bars_rise = smoothing_factor(rate_from_fraction(BARS_RISE), dt);
-        let spectrum_rise = smoothing_factor(rate_from_fraction(SPECTRUM_RISE), dt);
         for i in 0..self.bands {
             let target = self.targets[i];
             let cur = self.bars[i];
@@ -290,8 +279,6 @@ impl Analyzer {
             } else {
                 cur + (target - cur) * bars_fall
             };
-            let s = &mut self.spectrum[i];
-            *s += (target - *s) * spectrum_rise;
         }
 
         // After inactivity the flux baseline is stale: diffing against the
@@ -335,7 +322,6 @@ impl Analyzer {
 
         FrameAnalysis {
             bars: self.bars.clone(),
-            spectrum: self.spectrum.clone(),
             waveform,
             beat,
             flux,

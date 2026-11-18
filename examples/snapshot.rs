@@ -7,7 +7,7 @@
 //! This is an approximation of a terminal, not a terminal: font, hinting
 //! and cell metrics differ from any given emulator.
 //!
-//! cargo run --release --example snapshot -- --mode 6 --size 144x42 \
+//! cargo run --release --example snapshot -- --mode 5 --size 144x42 \
 //!     --at 4.5 --out shot.bmp [--lyric hello] [--font path.ttf] [--live]
 
 use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
@@ -197,7 +197,14 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    let mode: u8 = get("--mode").and_then(|v| v.parse().ok()).unwrap_or(6);
+    let mode: u8 = {
+        let m = get("--mode").and_then(|v| v.parse().ok()).unwrap_or(5);
+        if !(1..=5).contains(&m) {
+            eprintln!("--mode must be 1-5 (waterfall removed), got {m}");
+            std::process::exit(2);
+        }
+        m
+    };
     let (w, h) = get("--size")
         .and_then(|v| {
             let (a, b) = v.split_once('x')?;
@@ -212,6 +219,76 @@ fn main() {
         spectrum::theme::ColorDepth::parse(&get("--colors").unwrap_or_else(|| "true".into()))
             .unwrap_or(spectrum::theme::ColorDepth::True);
     let live = args.iter().any(|a| a == "--live");
+    let bench: Option<usize> = get("--bench").and_then(|v| v.parse().ok());
+    if let Some(frames) = bench {
+        // FRAME BUDGET BENCH (QA 09:49): real render path, no audio, no
+        // TUI. N frames at dt=1/60 through the same ui::snapshot loop;
+        // frame 0 = COLD (scene build + font raster + first draw), the
+        // rest warm frames of the cached scene. Prints cold, warm
+        // p50/p95/mean, total - measured on device, never claimed from
+        // language or implementation.
+        // All three through the custom-lyric path, matching QA's actual
+        // captures: hello (1 line), garden (1 line, viewport-fit case),
+        // and the long phrase (wraps to 3 lines at this band).
+        let texts: Vec<(&str, Option<&str>)> = vec![
+            ("hello", Some("hello")),
+            ("garden", Some("garden")),
+            (
+                "multiline",
+                Some("grow a garden out of sound silence is the resting soil"),
+            ),
+        ];
+        for at in [4.5f32, 1.5] {
+            for (label, lyric) in &texts {
+                // Honest cold: clear the per-(text, size) scene cache so
+                // this scenario's FIRST frame re-runs the scene build -
+                // not a warm hit on the identity shared with the
+                // previous scenario (QA 10:27).
+                spectrum::garden::clear_scene_cache();
+                let warmup = frames as f32 / 60.0;
+                let t0 = std::time::Instant::now();
+                let (_buf, times) = spectrum::ui::snapshot_timed(&spectrum::ui::Snapshot {
+                    mode,
+                    theme: "spectrum",
+                    depth,
+                    at,
+                    frozen: true,
+                    warmup,
+                    lyric: *lyric,
+                    width: w,
+                    height: h,
+                });
+                let wall = t0.elapsed();
+                if times.len() < 2 {
+                    println!("{label:?} @ {at}s: too few frames");
+                    continue;
+                }
+                let mut warm: Vec<u128> = times[1..].iter().map(|d| d.as_micros()).collect();
+                warm.sort_unstable();
+                let n = warm.len();
+                let pct = |p: usize| warm[(p * (n - 1) / 100).min(n - 1)];
+                let mean = warm.iter().sum::<u128>() as f64 / n as f64;
+                println!(
+                    "{label:?} @{at: >4}s {w}x{h} x{} mode {mode}: cold {:>8.2}ms | warm p50 {:>7.2}ms p95 {:>7.2}ms mean {:>7.2}ms | wall {:.2}s",
+                    times.len(),
+                    times[0].as_secs_f64() * 1000.0,
+                    pct(50) as f64 / 1000.0,
+                    pct(95) as f64 / 1000.0,
+                    mean / 1000.0,
+                    wall.as_secs_f64(),
+                );
+                if mode == 5 {
+                    // Coarse phase split of the LAST frame (draw_scene,
+                    // present, blit) from the instrumented render path.
+                    let (ds, pr, bl) = spectrum::garden::last_garden_phases();
+                    println!(
+                        "    phases (last frame): draw_scene {ds:6.2}ms present {pr:6.2}ms blit {bl:6.2}ms"
+                    );
+                }
+            }
+        }
+        return;
+    }
     let font_path = get("--font").unwrap_or_else(|| {
         if cfg!(windows) {
             "C:\\Windows\\Fonts\\consola.ttf".into()
@@ -281,6 +358,66 @@ fn main() {
     }
     img.save_bmp(&out).expect("write bmp");
     println!("wrote {out} ({}x{} px, {w}x{h} cells)", img.w, img.h);
+    if args.iter().any(|a| a == "--provenance") {
+        // The provenance companion map for the actual-pixel audit (QA
+        // 0417): photograph the SAME frame in the real terminal, then
+        // align cell-for-cell with this map. '#' = letter ink presented;
+        // 'X' = garden/paper OVER letter ink - a COUNTED erasure (these
+        // cells may look ink-grey with pale species: the colour is
+        // ambiguous, the provenance is not); 'g' = garden/paper with no
+        // letter ink; '.' = the rest of the frame outside the band.
+        // Modes other than 5 have no garden band: nothing is stashed.
+        match spectrum::garden::last_provenance() {
+            Some((band, map)) => {
+                println!(
+                    "provenance: band x={}..{} y={}..{} ({}x{} cells)",
+                    band.x,
+                    band.x + band.width,
+                    band.y,
+                    band.y + band.height,
+                    band.width,
+                    band.height
+                );
+                let mut counts = [0usize; 3];
+                for row in 0..h {
+                    let mut line = String::new();
+                    for col in 0..w {
+                        let in_band = col >= band.x
+                            && col < band.x + band.width
+                            && row >= band.y
+                            && row < band.y + band.height;
+                        let ch = if !in_band {
+                            '.'
+                        } else {
+                            let i = (row - band.y) as usize * (band.width as usize)
+                                + (col - band.x) as usize;
+                            match map.get(i).copied() {
+                                Some(spectrum::garden::PROV_INK) => {
+                                    counts[0] += 1;
+                                    '#'
+                                }
+                                Some(spectrum::garden::PROV_ERASED) => {
+                                    counts[1] += 1;
+                                    'X'
+                                }
+                                _ => {
+                                    counts[2] += 1;
+                                    'g'
+                                }
+                            }
+                        };
+                        line.push(ch);
+                    }
+                    println!("{line}");
+                }
+                println!(
+                    "provenance totals: ink {} | erased-over-ink {} | garden {}",
+                    counts[0], counts[1], counts[2]
+                );
+            }
+            None => println!("provenance: no garden band stashed for this mode"),
+        }
+    }
     if args.iter().any(|a| a == "--colors-report") {
         // Distinct fg/bg colours with counts: a cheap check that shading
         // roles (shadow / base / highlight / line) all reach the screen.

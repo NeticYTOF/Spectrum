@@ -202,19 +202,8 @@ pub fn synthetic_frame(t: f32, bands: usize) -> FrameAnalysis {
         })
         .collect();
 
-    // Spectrogram input: same profile with a touch of flicker.
-    let spectrum: Vec<f32> = bars
-        .iter()
-        .enumerate()
-        .map(|(i, b)| {
-            let flick = 0.94 + 0.06 * (t * 13.0 + i as f32).sin();
-            (b * flick).clamp(0.0, 1.0)
-        })
-        .collect();
-
     FrameAnalysis {
         bars,
-        spectrum,
         waveform: if energy <= 0.01 {
             Vec::new()
         } else {
@@ -282,7 +271,6 @@ mod tests {
         let a = synthetic_frame(4.375, 64);
         let b = synthetic_frame(4.375, 64);
         assert_eq!(a.bars, b.bars);
-        assert_eq!(a.spectrum, b.spectrum);
         assert_eq!(a.waveform.len(), b.waveform.len());
         assert!(!a.bars.is_empty());
     }
@@ -313,7 +301,6 @@ mod tests {
     fn frame_shapes_are_sane() {
         let f = synthetic_frame(4.5, 64);
         assert_eq!(f.bars.len(), 64);
-        assert_eq!(f.spectrum.len(), 64);
         assert!(f.bars.iter().all(|v| (0.0..=1.0).contains(v)));
         assert!(!f.waveform.is_empty(), "energetic frame has a waveform");
         assert!(f.waveform.iter().all(|v| v.abs() <= 1.0));
