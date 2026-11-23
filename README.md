@@ -26,3 +26,6 @@ there are expert flags too, any command line flag bypasses the menu entirely. --
 how it was all achieved. the whole thing is written in rust, the analysis runs on real audio samples through an fft, and the drawing is unicode and ansi color straight into the terminal. the lyrics garden is a port of ascii garden by ridit (mit license), it renders the genuine playfair display font (sil ofl 1.1) embedded in the binary and rasterized with ab_glyph, so the letterforms are actual serif shapes and not blocky ascii art, and the flowers grow out of the letters inside a strict budget so every letter stays readable. the own terminal is the official portable windows terminal runtime (mit) with the cascadia mono font (sil ofl 1.1), it keeps all its settings in its own folder next to the app and never touches your global terminal preferences. the project itself is mit licensed, see the license file, and the notice file has the details for the fonts and the terminal runtime.
 
 building from source for development is the same cargo build, and cargo test runs the tests.
+
+this project was create 100% by ai although i have put in my own efforts in this and this is not slop nor is it one shot.
+
